@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>资产折旧预算工作台</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span>Depreciation Budget</span>
+        <strong>资产折旧预算工作台</strong>
+      </div>
+      <nav class="flow-nav" aria-label="预算流程">
+        <button class="nav-item active" data-view="overview" type="button">总览</button>
+        <button class="nav-item" data-view="assets" type="button">资产工作台</button>
+        <button class="nav-item" data-view="wide" type="button">折旧宽表</button>
+        <button class="nav-item" data-view="whatif" type="button">What-if 测算</button>
+        <button class="nav-item" data-view="reverse" type="button">反向推演</button>
+        <button class="nav-item" data-view="compare" type="button">场景对比</button>
+      </nav>
+      <section class="source-card">
+        <h2>数据链路</h2>
+        <dl>
+          <dt>当前场景</dt>
+          <dd id="sourceScenario">-</dd>
+          <dt>预算版本</dt>
+          <dd id="sourceBudget">-</dd>
+          <dt>业务库更新时间</dt>
+          <dd id="sourceUpdated">-</dd>
+          <dt>规则版本</dt>
+          <dd id="sourceTriples">-</dd>
+          <dt>源文件</dt>
+          <dd id="sourceFiles">-</dd>
+          <dt>纳入 / 排除</dt>
+          <dd id="sourceAssetCounts">-</dd>
+        </dl>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="forecastScope">正在校验客户台账数据源...</p>
+          <h1 id="pageTitle">预算总览</h1>
+        </div>
+        <div class="top-actions">
+          <select id="scenarioSelect" aria-label="选择场景"></select>
+          <button id="refreshBtn" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section id="overview" class="view active">
+        <div class="kpi-grid">
+          <article class="kpi">
+            <span>当前预测范围折旧</span>
+            <strong id="kpiTotal">-</strong>
+          </article>
+          <article class="kpi">
+            <span>计划资产贡献</span>
+            <strong id="kpiPlanned">-</strong>
+          </article>
+          <article class="kpi">
+            <span>存量资产贡献</span>
+            <strong id="kpiCurrent">-</strong>
+          </article>
+          <article class="kpi">
+            <span>纳入测算资产</span>
+            <strong id="kpiAnomalies">-</strong>
+          </article>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>月度趋势</h2>
+              <span>台账实际与已验证预测月份</span>
+            </div>
+            <div id="annualChart" class="line-chart"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>部门排行</h2>
+              <span>点击部门查看折旧宽表</span>
+            </div>
+            <div id="departmentRank" class="rank-list"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>折旧构成说明</h2>
+              <span>占比、说明与主要贡献资产</span>
+            </div>
+            <div id="driverBreakdown" class="driver-grid"></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head">
+              <h2>主要贡献资产</h2>
+              <span>点击资产查看完整资产档案</span>
+            </div>
+            <div class="table-wrap compact">
+              <table>
+                <thead>
+                  <tr>
+                    <th>资产</th>
+                    <th>部门</th>
+                    <th>类别</th>
+                    <th>折旧</th>
+                  </tr>
+                </thead>
+                <tbody id="topAssetsBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel asset-card-panel">
+          <div class="panel-head">
+            <div>
+              <h2>重点资产</h2>
+              <span>从资产工作台检索全部资产；点击卡片可查看档案、政策与月度折旧记录</span>
+            </div>
+            <button id="openAssetsBtn" type="button">打开资产工作台</button>
+          </div>
+          <div id="assetCards" class="asset-card-grid"></div>
+        </section>
+      </section>
+
+      <section id="assets" class="view">
+        <section class="panel">
+          <div class="panel-head controls">
+            <div>
+              <h2>资产工作台</h2>
+              <span>在一个资产档案中查看台账属性、折旧记录、适用政策、规则依据和业务关系链</span>
+            </div>
+            <div class="control-row asset-search-controls">
+              <input id="assetSearchInput" placeholder="搜索资产编号、名称、部门或折旧码" aria-label="搜索资产">
+              <select id="assetDepartmentFilter" aria-label="筛选所属单位"></select>
+              <select id="assetCategoryFilter" aria-label="筛选资产类别"></select>
+              <select id="assetSourceFilter" aria-label="筛选资产来源">
+                <option value="">全部来源</option>
+                <option value="CURRENT">存量资产</option>
+                <option value="PLANNED">计划资产</option>
+              </select>
+              <button id="assetSearchBtn" type="button">查询</button>
+            </div>
+          </div>
+          <div id="assetWorkbenchStatus" class="table-status"></div>
+          <div id="assetWorkbenchCards" class="asset-card-grid asset-workbench-grid"></div>
+        </section>
+      </section>
+
+      <section id="wide" class="view">
+        <section class="panel">
+          <div class="panel-head controls">
+            <div>
+              <h2>折旧宽表</h2>
+              <span>默认查看全部资产；选择一级至三级分析维度后，可逐层展开当前数据覆盖期间</span>
+            </div>
+            <div class="control-row">
+              <label>一级维度<select id="wideDimension1"></select></label>
+              <label>二级维度<select id="wideDimension2"></select></label>
+              <label>三级维度<select id="wideDimension3"></select></label>
+              <button id="wideSearchBtn" type="button">查询</button>
+            </div>
+          </div>
+          <div id="wideStatus" class="table-status"></div>
+          <div class="table-wrap wide-table-wrap">
+            <table class="wide-table">
+              <thead id="wideTableHead"></thead>
+              <tbody id="wideTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel wide-question-panel">
+          <div class="panel-head controls">
+            <div>
+              <h2>宽表问答</h2>
+              <span>结合当前宽表筛选、预测明细和知识图谱推理</span>
+            </div>
+            <div class="question-box">
+              <input id="wideQuestionInput" placeholder="例如：8月比7月少的原因是什么？">
+              <button id="wideQuestionBtn" type="button">提问</button>
+            </div>
+          </div>
+          <div id="wideQaStatus" class="qa-connection-status"></div>
+          <div id="wideQuestionResult" class="wide-question-result"></div>
+        </section>
+      </section>
+
+      <section id="whatif" class="view">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>What-if 测算</h2>
+              <span>选择规则场景，保存独立测算版本并重算当前数据覆盖期间</span>
+            </div>
+          </div>
+          <form id="scenarioForm" class="scenario-form">
+            <label>场景名称<input id="scenarioName" placeholder="输入场景名称"></label>
+            <label>场景说明<input id="scenarioDescription" placeholder="输入场景说明"></label>
+            <label>基准场景<select id="scenarioBase"></select></label>
+            <label>规则场景<select id="ruleTemplate"></select></label>
+            <label>目标资产<select id="scenarioAsset"></select></label>
+            <label>区块<input id="scenarioBlock" placeholder="从当前配置表选择或输入"></label>
+            <label>公司<input id="scenarioCompany" placeholder="由当前台账自动带入"></label>
+            <label>生效月份<input id="scenarioPeriod" placeholder="从当前预测范围选择"></label>
+            <label>金额 / 减值金额<input id="scenarioAmount" type="number" min="0" step="0.01"></label>
+            <label>产量<input id="scenarioProduction" type="number" min="0" step="0.0001"></label>
+            <label>剩余储量<input id="scenarioReserves" type="number" min="0" step="0.0001"></label>
+            <label>工作量<input id="scenarioWorkload" type="number" min="0" step="0.0001"></label>
+            <label>单位费用<input id="scenarioUnitFee" type="number" min="0" step="0.0001"></label>
+            <label>开始计提<select id="scenarioStartRule"><option value="NEXT_MONTH">次月开始计提</option><option value="CURRENT_MONTH">当月开始计提</option></select></label>
+            <label>新增资产名称<input id="scenarioAssetName" placeholder="输入新增资产名称"></label>
+            <label>新增资产类别<input id="scenarioAssetCategory"></label>
+            <label>新增资产折旧码<input id="scenarioDepreciationCode" placeholder="从当前折旧码目录选择"></label>
+            <label>资本化日期<input id="scenarioInServiceDate" type="date"></label>
+            <button id="addScenarioAssumptionBtn" type="button">加入场景假设</button>
+            <button type="submit">保存场景并重算</button>
+          </form>
+          <section class="scenario-assumption-panel" aria-labelledby="scenarioAssumptionsTitle">
+            <div class="panel-head compact-head">
+              <div>
+                <h3 id="scenarioAssumptionsTitle">本场景假设</h3>
+                <span>同一场景可叠加多条假设，统一重算后保存。</span>
+              </div>
+              <button id="clearScenarioAssumptionsBtn" type="button" title="清空当前草稿">清空</button>
+            </div>
+            <div id="scenarioAssumptionList" class="scenario-assumption-list"></div>
+          </section>
+          <div id="whatIfResult" class="result-box"></div>
+        </section>
+      </section>
+
+      <section id="reverse" class="view">
+        <section class="panel reverse-planning-panel">
+          <div class="panel-head">
+            <div>
+              <h2>反向推演</h2>
+              <span>提出目标期折旧金额或增减目标，系统以规则引擎和知识图谱试算可行方案</span>
+            </div>
+          </div>
+          <div class="reverse-chat">
+            <div class="reverse-chat-intro">输入当前预测范围内的目标金额或增减目标。推荐仅为业务假设，不会创建场景。</div>
+            <div class="question-box reverse-question-box">
+              <input id="reverseQuestionInput" placeholder="例如：8月某所属单位折旧降低10000" aria-label="反向推演目标">
+              <button id="reverseQuestionBtn" type="button">开始推演</button>
+            </div>
+          </div>
+          <div id="reversePlanningResult" class="reverse-planning-result"></div>
+        </section>
+      </section>
+
+      <section id="compare" class="view">
+        <section class="panel">
+          <div class="panel-head controls">
+            <div>
+              <h2>场景对比</h2>
+              <span>多场景、多期间横向比较宽表，差异只在当前容器内滚动</span>
+            </div>
+            <div class="control-row compare-controls">
+              <label>场景
+                <select id="compareScenarios" multiple size="4"></select>
+              </label>
+              <label>行类型
+                <select id="compareRowType">
+                  <option value="asset">资产</option>
+                  <option value="department">部门</option>
+                  <option value="category">类别</option>
+                </select>
+              </label>
+              <label>起始期间
+                <input id="comparePeriodFrom" aria-label="场景对比起始期间">
+              </label>
+              <label>结束期间
+                <input id="comparePeriodTo" aria-label="场景对比结束期间">
+              </label>
+              <label>差异模式
+                <select id="compareDiffMode">
+                  <option value="amount">金额差异</option>
+                  <option value="percent">百分比差异</option>
+                  <option value="both">金额 + 百分比</option>
+                </select>
+              </label>
+              <button id="compareBtn" type="button">对比</button>
+            </div>
+          </div>
+          <div id="compareStatus" class="table-status"></div>
+          <div class="table-wrap wide-table-wrap compare-table-wrap">
+            <table class="wide-table compare-table">
+              <thead id="compareTableHead"></thead>
+              <tbody id="compareTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+    </main>
+
+    <div id="assetDrawerBackdrop" class="asset-drawer-backdrop" hidden></div>
+    <aside id="assetDrawer" class="asset-drawer" aria-label="资产详情" aria-hidden="true">
+      <div class="asset-drawer-head">
+        <div>
+          <span>资产档案</span>
+          <h2 id="assetDrawerTitle">资产详情</h2>
+        </div>
+        <button id="assetDrawerCloseBtn" class="icon-button" type="button" aria-label="关闭资产详情" title="关闭">×</button>
+      </div>
+      <div id="assetDrawerBody" class="asset-drawer-body"></div>
+    </aside>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
