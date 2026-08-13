@@ -1540,6 +1540,7 @@ class DemoState:
                 "attribution_count": neo4j_counts.get("attribution_count", 0),
             },
             "object_types": meta["object_types"],
+            "link_types": meta["link_types"],
             "nodes": nodes,
             "edges": edges,
             "actions": meta["action_types"],

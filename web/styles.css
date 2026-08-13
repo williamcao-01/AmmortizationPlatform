@@ -1978,19 +1978,92 @@ th.sticky-col {
   flex-direction: column;
 }
 
-.graph-focus-canvas {
+.graph-focus-canvas,
+.graph-type-canvas {
   display: grid;
   flex: 1;
   min-height: 550px;
-  place-items: center;
+  place-items: stretch;
   padding: 14px;
   border-right: 1px solid var(--line);
   background: #f8fafb;
+  overflow: auto;
 }
 
-.graph-focus-canvas svg {
+.graph-focus-canvas svg,
+.graph-type-canvas svg {
   width: 100%;
   min-height: 500px;
+  min-width: 920px;
+}
+
+.graph-type-edge line {
+  stroke: #a5b7bc;
+  stroke-width: 1.25;
+  marker-end: url(#typeArrow);
+}
+
+.graph-type-edge.connected line {
+  stroke: #157e74;
+  stroke-width: 2;
+}
+
+.graph-type-edge text {
+  fill: #5c6b78;
+  font-size: 11px;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: #f8fafb;
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+
+.graph-type-edge.connected text {
+  fill: #08776d;
+  font-weight: 700;
+}
+
+.graph-type-node {
+  cursor: pointer;
+}
+
+.graph-type-node rect {
+  fill: #ffffff;
+  stroke: #7f98a1;
+  stroke-width: 1.5;
+}
+
+.graph-type-node:hover rect {
+  fill: #effaf6;
+  stroke: #08776d;
+}
+
+.graph-type-node.selected rect {
+  fill: #08776d;
+  stroke: #08776d;
+  stroke-width: 2.5;
+}
+
+.graph-type-node text {
+  fill: #102a43;
+  font-size: 13px;
+  font-weight: 750;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.graph-type-node .node-type {
+  fill: #6b7280;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.graph-type-node.selected text {
+  fill: #ffffff;
+}
+
+.graph-type-node.selected .node-type {
+  fill: #d9f3ed;
 }
 
 .graph-focus-edge line {

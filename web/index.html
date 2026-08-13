@@ -156,7 +156,7 @@
           <div class="panel-head controls">
             <div>
               <h2>知识图谱</h2>
-              <span>浏览当前客户台账、配置和已保存场景形成的真实业务对象与关系；不包含演示数据。</span>
+              <span>中间展示 Ontology 业务对象类型及关系语义；从类型进入实体清单，再查看单个实体的属性与关联对象。</span>
             </div>
             <div class="control-row graph-search-controls">
               <input id="graphObjectSearch" placeholder="搜索对象编号、名称、折旧码、类别或所属单位" aria-label="搜索图谱对象">
@@ -168,7 +168,7 @@
           <div class="ontology-explorer-layout">
             <aside class="graph-object-browser" aria-label="图谱业务对象清单">
               <div class="graph-browser-head">
-                <strong>业务对象</strong>
+                <strong id="graphObjectListTitle">业务实体清单</strong>
                 <span id="graphObjectCount">-</span>
               </div>
               <div id="graphObjectList" class="graph-object-list"></div>
@@ -176,16 +176,16 @@
             <section class="graph-network-panel" aria-labelledby="graphNetworkTitle">
               <div class="graph-network-head">
                 <div>
-                  <h3 id="graphNetworkTitle">对象关系图</h3>
-                  <span id="graphSelectionHint">从左侧选择一个业务对象</span>
+                  <h3 id="graphNetworkTitle">业务对象类型关系</h3>
+                  <span id="graphSelectionHint">点击类型节点，查看该类型下的真实业务实体</span>
                 </div>
-                <span class="graph-legend"><i></i> 当前对象 <i></i> 直接关联对象</span>
+                <span class="graph-legend"><i></i> 已选类型 <i></i> 可关联类型</span>
               </div>
-              <div id="graphCanvas" class="graph-canvas graph-focus-canvas"></div>
+              <div id="graphCanvas" class="graph-canvas graph-type-canvas"></div>
             </section>
             <aside class="graph-detail-panel" aria-label="图谱对象详情">
-              <div class="graph-detail-head"><strong>对象详情</strong><span>完整属性与关系</span></div>
-              <div id="graphNodeDetail" class="graph-node-detail">从左侧选择一个业务对象查看详情。</div>
+              <div class="graph-detail-head"><strong>业务实体详情</strong><span>属性与关联实体</span></div>
+              <div id="graphNodeDetail" class="graph-node-detail">先在中间选择业务对象类型，再从左侧选择一个业务实体。</div>
             </aside>
           </div>
         </section>

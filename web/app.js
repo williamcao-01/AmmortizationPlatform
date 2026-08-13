@@ -6,6 +6,7 @@ const state = {
   assetCards: [],
   assetWorkbenchCards: [],
   graph: null,
+  graphSelectedType: "",
   graphSelectedNodeId: null,
   ruleCatalog: null,
   scenarioAssetDetail: null,
@@ -1665,6 +1666,12 @@ const loadKnowledgeGraph = async () => {
   try {
     state.graph = await api(`/api/knowledge-graph?scenario_id=${encodeURIComponent(state.scenarioId)}&focus=${encodeURIComponent(focus)}`);
     hydrateGraphObjectTypeFilter(state.graph.object_types || []);
+    if (!state.graphSelectedType || !asArray(state.graph.object_types).some((item) => item.type_id === state.graphSelectedType)) {
+      state.graphSelectedType = asArray(state.graph.object_types).find((item) => item.type_id === "FixedAsset")?.type_id
+        || asArray(state.graph.object_types).find((item) => asArray(state.graph.nodes).some((node) => node.object_type === item.type_id))?.type_id
+        || "";
+    }
+    state.graphSelectedNodeId = null;
     renderGraphExplorer();
   } catch (error) {
     el("graphCanvas").innerHTML = `<p class="empty-note">知识图谱加载失败：${escapeHtml(error.message)}</p>`;
@@ -1676,8 +1683,8 @@ const loadKnowledgeGraph = async () => {
 
 const hydrateGraphObjectTypeFilter = (objectTypes) => {
   const select = el("graphObjectType");
-  const current = select.value;
-  select.innerHTML = `<option value="">全部对象</option>`;
+  const current = state.graphSelectedType || select.value;
+  select.innerHTML = `<option value="">选择业务对象类型</option>`;
   asArray(objectTypes).forEach((item) => {
     const option = document.createElement("option");
     option.value = item.type_id;
@@ -1689,10 +1696,10 @@ const hydrateGraphObjectTypeFilter = (objectTypes) => {
 
 const filteredGraphNodes = () => {
   const rawNodes = asArray(state.graph?.nodes);
-  const selectedType = el("graphObjectType")?.value || "";
+  const selectedType = state.graphSelectedType || el("graphObjectType")?.value || "";
   const keyword = (el("graphObjectSearch")?.value || "").trim().toLowerCase();
   return rawNodes.filter((node) => {
-    if (selectedType && node.object_type !== selectedType) return false;
+    if (!selectedType || node.object_type !== selectedType) return false;
     if (!keyword) return true;
     const text = [
       node.id, node.label_cn, node.subtitle_cn, node.technical_ref,
@@ -1705,8 +1712,16 @@ const filteredGraphNodes = () => {
 const renderGraphExplorer = () => {
   const nodes = filteredGraphNodes();
   renderGraphKpis(state.graph?.summary || {});
-  el("graphObjectCount").textContent = `显示 ${nodes.length} / ${asArray(state.graph?.nodes).length}`;
+  renderGraphTypeModel();
+  const selectedType = asArray(state.graph?.object_types).find((item) => item.type_id === state.graphSelectedType);
+  el("graphObjectListTitle").textContent = selectedType ? `${selectedType.label_cn || selectedType.type_id}实体清单` : "业务实体清单";
+  el("graphObjectCount").textContent = selectedType ? `显示 ${nodes.length}` : "请先选择类型";
   const list = el("graphObjectList");
+  if (!selectedType) {
+    list.innerHTML = `<p class="empty-note">请在中间图中选择一个业务对象类型。</p>`;
+    el("graphNodeDetail").textContent = "先在中间选择业务对象类型，再从左侧选择一个业务实体。";
+    return;
+  }
   list.innerHTML = nodes.map((node) => {
     const id = node.id || node.object_id;
     return `<button type="button" class="graph-object-row ${state.graphSelectedNodeId === id ? "selected" : ""}" data-graph-node-id="${escapeHtml(id)}">
@@ -1722,7 +1737,18 @@ const renderGraphExplorer = () => {
     return;
   }
   if (nodes[0]) selectGraphNode(nodes[0].id || nodes[0].object_id);
-  else renderGraphFocus(null);
+  else {
+    state.graphSelectedNodeId = null;
+    el("graphNodeDetail").textContent = "当前类型没有可展示的业务实体。";
+  }
+};
+
+const selectGraphType = (typeId) => {
+  if (!typeId) return;
+  state.graphSelectedType = typeId;
+  state.graphSelectedNodeId = null;
+  el("graphObjectType").value = typeId;
+  renderGraphExplorer();
 };
 
 const selectGraphNode = async (nodeId) => {
@@ -1734,113 +1760,69 @@ const selectGraphNode = async (nodeId) => {
   await loadGraphNodeDetail(nodeId);
 };
 
-const renderKnowledgeGraph = (data) => {
-  renderGraphKpis(data.summary || {});
-  const selectedType = el("graphTypeFilter")?.value || "";
-  const rawNodes = asArray(data.nodes || data.graph?.nodes);
-  const nodes = selectedType
-    ? rawNodes.filter((node) => (node.object_type || node.type) === selectedType)
-    : rawNodes;
-  const nodeIds = new Set(nodes.map((node) => String(node.id || node.object_id)));
-  const edges = asArray(data.edges || data.graph?.edges)
-    .filter((edge) => nodeIds.has(String(edge.source || edge.from)) && nodeIds.has(String(edge.target || edge.to)));
-  const positioned = positionGraphNodes(nodes);
-  const nodeById = new Map(positioned.map((node) => [String(node.id), node]));
-  const edgeMarkup = edges.map((edge) => {
-    const source = nodeById.get(String(edge.source || edge.from));
-    const target = nodeById.get(String(edge.target || edge.to));
+const renderGraphTypeModel = () => {
+  const types = asArray(state.graph?.object_types).map((item) => ({
+    ...item,
+    id: item.type_id,
+    label: item.label_cn || item.type_id,
+    instanceCount: asArray(state.graph?.nodes).filter((node) => node.object_type === item.type_id).length,
+  }));
+  const typeIds = new Set(types.map((item) => item.type_id));
+  const links = asArray(state.graph?.link_types).filter((item) => typeIds.has(item.source_type) && typeIds.has(item.target_type));
+  const positioned = positionGraphTypeNodes(types, links);
+  const nodeById = new Map(positioned.map((node) => [node.id, node]));
+  const edgeMarkup = links.map((link) => {
+    const source = nodeById.get(link.source_type);
+    const target = nodeById.get(link.target_type);
     if (!source || !target) return "";
-    const midX = (source.x + target.x) / 2;
-    const midY = (source.y + target.y) / 2;
-    return `
-      <g class="graph-edge" data-edge-id="${escapeHtml(edge.id || "")}">
-        <line x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}"></line>
-        <text x="${midX}" y="${midY}">${escapeHtml(truncate(edge.label_cn || edge.predicate_label_cn || edge.label || edge.relation || edge.predicate || "", 16))}</text>
-      </g>
-    `;
+    const midX = Math.round((source.x + target.x) / 2);
+    const midY = Math.round((source.y + target.y) / 2);
+    return `<g class="graph-type-edge ${source.id === state.graphSelectedType || target.id === state.graphSelectedType ? "connected" : ""}">
+      <line x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}"></line>
+      <text x="${midX}" y="${midY}">${escapeHtml(truncate(link.label_cn || link.type_id, 18))}</text>
+    </g>`;
   }).join("");
-  const nodeMarkup = positioned.map((node) => `
-    <g class="graph-node" data-node-id="${escapeHtml(node.id)}" transform="translate(${node.x} ${node.y})">
-      <circle r="${node.r}" class="node-${escapeHtml(node.type || "default")}"></circle>
-      <text y="-3">${escapeHtml(truncate(node.label || node.name || node.id, 14))}</text>
-      <text y="14" class="node-type">${escapeHtml(truncate(node.type_label_cn || node.type_cn || node.type || "节点", 12))}</text>
-    </g>
-  `).join("");
-  el("graphCanvas").innerHTML = `
-    <svg viewBox="0 0 1180 760" preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-          <path d="M0,0 L8,4 L0,8 Z"></path>
-        </marker>
-      </defs>
-      ${edgeMarkup}
-      ${nodeMarkup}
-    </svg>
-  `;
-  el("graphCanvas").querySelectorAll(".graph-node").forEach((nodeEl) => {
-    nodeEl.addEventListener("click", () => {
-      const node = nodeById.get(nodeEl.dataset.nodeId);
-      markGraphSelection(node?.id);
-      loadGraphNodeDetail(node?.id);
-    });
+  const nodeMarkup = positioned.map((node) => `<g class="graph-type-node ${node.id === state.graphSelectedType ? "selected" : ""}" data-graph-type-id="${escapeHtml(node.id)}" transform="translate(${node.x} ${node.y})">
+    <rect x="-${node.width / 2}" y="-${node.height / 2}" width="${node.width}" height="${node.height}" rx="6"></rect>
+    <text y="-5">${escapeHtml(truncate(node.label, 16))}</text>
+    <text y="15" class="node-type">${escapeHtml(`${node.instanceCount} 个实体`)}</text>
+  </g>`).join("");
+  el("graphCanvas").innerHTML = `<svg viewBox="0 0 1180 760" preserveAspectRatio="xMidYMid meet" role="img" aria-label="业务对象类型和关系语义图">
+    <defs><marker id="typeArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z"></path></marker></defs>
+    ${edgeMarkup}${nodeMarkup}
+  </svg>`;
+  el("graphSelectionHint").textContent = state.graphSelectedType
+    ? `已选择“${types.find((item) => item.id === state.graphSelectedType)?.label || state.graphSelectedType}”；左侧显示该类型的业务实体。`
+    : "点击类型节点，查看该类型下的真实业务实体。";
+  el("graphCanvas").querySelectorAll("[data-graph-type-id]").forEach((node) => {
+    node.addEventListener("click", () => selectGraphType(node.dataset.graphTypeId));
   });
-  el("graphCanvas").querySelectorAll(".graph-edge").forEach((edgeEl) => {
-    edgeEl.addEventListener("click", () => {
-      document.querySelectorAll(".graph-edge").forEach((item) => item.classList.toggle("selected", item === edgeEl));
-    });
-  });
-  renderGraphLineage(data.lineage || {});
-  if (positioned[0]) {
-    markGraphSelection(positioned[0].id);
-    loadGraphNodeDetail(positioned[0].id);
-  } else {
-    renderGraphNodeDetail(null);
-  }
 };
 
-const positionGraphNodes = (nodes) => {
-  const width = 1180;
-  const height = 760;
-  const padX = 72;
-  const padY = 70;
-  const normalized = nodes.map((node) => ({
-    ...node,
-    id: node.id || node.object_id || node.node_id || node.name,
-    label: node.label_cn || node.label || node.name || node.id,
-    type: node.object_type || node.type || node.node_type || "default",
-  }));
-  const preferred = [
-    "Scenario",
-    "Department",
-    "CostCenter",
-    "ProfitCenter",
-    "FixedAsset",
-    "PlannedAsset",
-    "AssetEvent",
-    "AssetCategory",
-    "DepreciationCode",
-    "DepreciationPolicy",
-    "ForecastLine",
-    "Anomaly",
+const positionGraphTypeNodes = (types, links) => {
+  const columns = [
+    ["Department", "CostCenter", "ProfitCenter", "Block"],
+    ["FixedAsset", "PlannedAsset", "AssetEvent", "Anomaly"],
+    ["AssetCategory", "DepreciationCode", "DepreciationPolicy", "DepreciationMethod", "CalculationRule"],
+    ["Scenario", "ScenarioAssumption", "MonthlyDriver", "ForecastLine"],
+    ["ReversePlanningTarget", "RecommendedAction", "ReverseRecommendation"],
   ];
-  const groups = new Map();
-  normalized.forEach((node) => {
-    if (!groups.has(node.type)) groups.set(node.type, []);
-    groups.get(node.type).push(node);
+  const columnByType = new Map();
+  columns.forEach((column, index) => column.forEach((type) => columnByType.set(type, index)));
+  const grouped = new Map();
+  types.forEach((type) => {
+    const column = columnByType.get(type.id) ?? columns.length - 1;
+    if (!grouped.has(column)) grouped.set(column, []);
+    grouped.get(column).push(type);
   });
-  const orderedTypes = [
-    ...preferred.filter((type) => groups.has(type)),
-    ...[...groups.keys()].filter((type) => !preferred.includes(type)).sort(),
-  ];
-  const rowGap = (height - padY * 2) / Math.max(orderedTypes.length - 1, 1);
-  return orderedTypes.flatMap((type, rowIndex) => {
-    const row = groups.get(type).sort((a, b) => String(a.id).localeCompare(String(b.id), "zh-CN"));
-    const colGap = (width - padX * 2) / Math.max(row.length - 1, 1);
-    return row.map((node, colIndex) => ({
-      ...node,
-      x: Math.round(row.length === 1 ? width / 2 : padX + colIndex * colGap),
-      y: Math.round(padY + rowIndex * rowGap),
-      r: node.type === "DepreciationPolicy" || node.type === "Anomaly" ? 28 : 24,
+  return [...grouped.entries()].flatMap(([column, items]) => {
+    const ordered = items.sort((left, right) => String(left.label).localeCompare(String(right.label), "zh-CN"));
+    return ordered.map((item, index) => ({
+      ...item,
+      x: 118 + column * 236,
+      y: Math.round(92 + index * ((590 / Math.max(ordered.length - 1, 1)))),
+      width: 148,
+      height: 56,
     }));
   });
 };
@@ -1873,7 +1855,6 @@ const renderGraphKpis = (summary) => {
 const loadGraphNodeDetail = async (nodeId) => {
   if (!nodeId) {
     el("graphNodeDetail").textContent = "暂无节点详情";
-    renderGraphFocus(null);
     return;
   }
   try {
@@ -1949,7 +1930,6 @@ const renderGraphNodeDetail = (detail) => {
   const functions = asArray(detail.functions);
   const risks = asArray(detail.risks);
   const nodeId = node.id || node.object_id;
-  renderGraphFocus(detail);
   el("graphNodeDetail").innerHTML = `
     <section class="graph-detail-title">
       <span>${escapeHtml(node.object_type || "业务对象")}</span>
@@ -1976,7 +1956,14 @@ const renderGraphNodeDetail = (detail) => {
   `;
   el("graphNodeDetail").querySelectorAll(".graph-related").forEach((button) => {
     button.addEventListener("click", () => {
-      selectGraphNode(button.dataset.nodeId);
+      const relatedNode = asArray(state.graph?.nodes).find((item) => String(item.id || item.object_id) === button.dataset.nodeId);
+      if (relatedNode?.object_type) {
+        state.graphSelectedType = relatedNode.object_type;
+        state.graphSelectedNodeId = button.dataset.nodeId;
+        el("graphObjectType").value = relatedNode.object_type;
+        renderGraphExplorer();
+        loadGraphNodeDetail(button.dataset.nodeId);
+      }
     });
   });
   el("graphNodeDetail").querySelectorAll(".graph-action").forEach((button) => {
@@ -2252,8 +2239,7 @@ el("reverseQuestionInput").addEventListener("keydown", (event) => {
 });
 el("graphObjectSearch").addEventListener("input", renderGraphExplorer);
 el("graphObjectType").addEventListener("change", () => {
-  state.graphSelectedNodeId = null;
-  renderGraphExplorer();
+  selectGraphType(el("graphObjectType").value);
 });
 el("scenarioForm").addEventListener("submit", submitScenario);
 el("newScenarioBtn").addEventListener("click", async () => {
