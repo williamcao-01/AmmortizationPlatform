@@ -93,6 +93,132 @@ class Neo4jOntologyStore:
             record = session.run(query, from_id=from_id, to_id=to_id).single()
         return [self._relationship_record(item) for item in record["links"]] if record else []
 
+    def forecast_lines(
+        self,
+        *,
+        scenario_id: str,
+        department: str | None = None,
+        asset_category: str | None = None,
+        asset_source_type: str | None = None,
+        period_from: str | None = None,
+        period_to: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Read persisted asset-month evidence through a parameterized Cypher query."""
+        clauses = ["record.scenario_id = $scenario_id"]
+        params: dict[str, Any] = {"scenario_id": scenario_id, "limit": limit, "offset": offset}
+        for field, value in (
+            ("department", department),
+            ("asset_category", asset_category),
+            ("asset_source_type", asset_source_type),
+        ):
+            if value:
+                clauses.append(f"record.{field} = ${field}")
+                params[field] = value
+        if period_from:
+            clauses.append("record.period >= $period_from")
+            params["period_from"] = period_from
+        if period_to:
+            clauses.append("record.period <= $period_to")
+            params["period_to"] = period_to
+        query = f"""
+        MATCH (record:ForecastRecord)
+        WHERE {' AND '.join(clauses)}
+        RETURN record
+        ORDER BY record.period, record.department, record.asset_id
+        SKIP $offset LIMIT $limit
+        """
+        with self.driver.session(database=self.database) as session:
+            return [dict(item["record"]) for item in session.run(query, **params)]
+
+    def available_periods(self, scenario_id: str) -> list[str]:
+        query = """
+        MATCH (record:ForecastRecord {scenario_id: $scenario_id})
+        RETURN DISTINCT record.period AS period
+        ORDER BY period
+        """
+        with self.driver.session(database=self.database) as session:
+            return [str(item["period"]) for item in session.run(query, scenario_id=scenario_id)]
+
+    def rule_executions(
+        self,
+        *,
+        scenario_id: str,
+        asset_refs: list[str] | None = None,
+        period: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["execution.scenario_id = $scenario_id"]
+        params: dict[str, Any] = {"scenario_id": scenario_id, "asset_refs": asset_refs or []}
+        if asset_refs:
+            clauses.append("execution.asset_ref IN $asset_refs")
+        if period:
+            clauses.append("execution.period = $period")
+            params["period"] = period
+        query = f"""
+        MATCH (execution:RuleExecution)
+        WHERE {' AND '.join(clauses)}
+        RETURN execution
+        ORDER BY execution.period, execution.asset_ref, execution.execution_id
+        """
+        with self.driver.session(database=self.database) as session:
+            rows = [dict(item["execution"]) for item in session.run(query, **params)]
+        for row in rows:
+            row["inputs"] = json.loads(row.get("rule_inputs_json") or "{}")
+        return rows
+
+    def entity_catalog(self, scenario_id: str) -> dict[str, list[str]]:
+        query = """
+        MATCH (record:ForecastRecord {scenario_id: $scenario_id})
+        RETURN collect(DISTINCT record.company) AS companies,
+               collect(DISTINCT record.department) AS departments,
+               collect(DISTINCT record.asset_category) AS asset_categories,
+               collect(DISTINCT record.asset_id) AS asset_refs
+        """
+        with self.driver.session(database=self.database) as session:
+            row = session.run(query, scenario_id=scenario_id).single()
+        return {
+            key: sorted(str(value) for value in (row[key] or []) if value)
+            for key in ("companies", "departments", "asset_categories", "asset_refs")
+        }
+
+    def eligible_asset_refs(
+        self,
+        *,
+        scenario_id: str,
+        scope_type: str,
+        scope_value: str,
+    ) -> list[str]:
+        field = {"company": "company", "department": "department", "asset_category": "asset_category"}.get(scope_type)
+        if field is None:
+            return []
+        query = f"""
+        MATCH (:OntologyObject {{object_id: $scenario_object_id}})-[:HAS_FORECAST_RECORD]->(record:ForecastRecord)
+              -[:CALCULATED_FOR]->(asset:OntologyObject)
+        WHERE record.{field} = $scope_value
+          AND asset.object_type = 'FixedAsset'
+        RETURN DISTINCT asset.technical_ref AS asset_ref
+        ORDER BY asset_ref
+        """
+        with self.driver.session(database=self.database) as session:
+            return [str(item["asset_ref"]) for item in session.run(
+                query,
+                scenario_object_id=f"Scenario:{scenario_id}",
+                scope_value=scope_value,
+            ) if item["asset_ref"]]
+
+    def policy_object_id_for_asset(self, asset_object_id: str) -> str | None:
+        query = """
+        MATCH (asset:OntologyObject {object_id: $asset_object_id})
+        MATCH path = shortestPath((asset)-[:BUSINESS_RELATION*..8]-(policy:OntologyObject {object_type: 'DepreciationPolicy'}))
+        RETURN policy.object_id AS policy_object_id
+        ORDER BY length(path), policy.object_id
+        LIMIT 1
+        """
+        with self.driver.session(database=self.database) as session:
+            row = session.run(query, asset_object_id=asset_object_id).single()
+        return str(row["policy_object_id"]) if row and row["policy_object_id"] else None
+
     def counts(self) -> dict[str, int]:
         query = """
         CALL {

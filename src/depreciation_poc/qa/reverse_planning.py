@@ -25,6 +25,8 @@ class ReversePlanningTools:
     simulate: Callable[[list[dict[str, Any]], dict[str, Any]], dict[str, Any]]
     ontology_path: Callable[[dict[str, Any]], list[dict[str, Any]]]
     catalog: Callable[..., dict[str, Any]]
+    eligible_asset_refs: Callable[..., list[str]] | None = None
+    graph_read_status: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -160,6 +162,7 @@ class ReversePlanningSkill:
         audit_id = f"RP-{uuid.uuid4().hex[:12].upper()}"
         started_at = time.perf_counter()
         execution = self._execute_plan(plan, conversation)
+        self._annotate_trace_source(execution["harness"]["tool_trace"])
         composition_context = {
             "task": "reverse_planning_answer_composition",
             "question": question,
@@ -371,6 +374,19 @@ class ReversePlanningSkill:
     @staticmethod
     def _trace(tool_name: str, result_shape: dict[str, Any]) -> dict[str, Any]:
         return {"tool_name": tool_name, "label_cn": ReversePlanningHarness.function_catalog[tool_name], "read_only": True, "result_shape": result_shape}
+
+    def _annotate_trace_source(self, trace: list[dict[str, Any]]) -> None:
+        status = self.tools.graph_read_status() if self.tools.graph_read_status else {"active": False}
+        for item in trace:
+            if item.get("tool_name") in {"list_available_periods", "resolve_target_scope", "read_scope_baseline", "resolve_eligible_objects", "get_rule_execution_evidence", "trace_reverse_ontology_path"}:
+                item["data_source"] = "Neo4j / Cypher" if status.get("active") else "SQLite / SQL fallback"
+                item["query_mode"] = "parameterized_read_only"
+            elif item.get("tool_name") == "simulate_rule_actions":
+                item["data_source"] = "本地折旧规则引擎"
+                item["query_mode"] = "temporary_calculation_no_write"
+            else:
+                item["data_source"] = "Harness deterministic planning"
+                item["query_mode"] = "in_memory_read_only"
 
     def _scope_total(self, plan: dict[str, Any]) -> Decimal:
         filters = {"scenario_id": plan["scenario_id"], "period_from": plan["target_period"], "period_to": plan["target_period"], "limit": 10000}

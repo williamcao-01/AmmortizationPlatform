@@ -325,6 +325,8 @@ class WideTableQATools:
     policy_narrative: Callable[[str, str], dict[str, Any]]
     rule_executions: Callable[..., list[dict[str, Any]]] | None = None
     available_periods: Callable[[str], list[str]] | None = None
+    entity_catalog: Callable[[str], dict[str, list[str]]] | None = None
+    graph_read_status: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -537,6 +539,7 @@ class WideTableQASkill:
 
         plan = validation["plan"]
         execution = self._execute_plan(question=question, plan=plan)
+        self._annotate_trace_source(execution["harness"]["tool_trace"])
         composition_context = self._composition_context(
             question=question,
             plan=plan,
@@ -586,7 +589,7 @@ class WideTableQASkill:
 
     def catalog(self, scenario_id: str = "BASELINE") -> dict[str, Any]:
         periods = self.tools.available_periods(scenario_id) if self.tools.available_periods else []
-        lines = self.tools.forecast_lines(scenario_id=scenario_id, limit=10000)
+        entities = self._entity_catalog(scenario_id)
         return {
             **self.harness.catalog(scenario_id=scenario_id, periods=periods),
             "ontology_objects": [
@@ -606,8 +609,8 @@ class WideTableQASkill:
                 {"id": "executes_rule", "label_cn": "命中计算规则"},
             ],
             "filter_values": {
-                "departments": sorted({str(line.get("department")) for line in lines if line.get("department")} ),
-                "asset_categories": sorted({str(line.get("asset_category")) for line in lines if line.get("asset_category")} ),
+                "departments": entities["departments"],
+                "asset_categories": entities["asset_categories"],
             },
         }
 
@@ -619,16 +622,16 @@ class WideTableQASkill:
         available_periods: list[str],
         conversation: ConversationState,
     ) -> dict[str, Any]:
-        lines = self.tools.forecast_lines(scenario_id=str(default_scope["scenario_id"]), limit=10000)
+        entities = self._entity_catalog(str(default_scope["scenario_id"]))
         return {
             "task": "question_understanding",
             "question": question,
             "current_wide_table_scope": default_scope,
             "available_periods": available_periods,
             "available_entities": {
-                "departments": sorted({str(line.get("department")) for line in lines if line.get("department")} ),
-                "asset_categories": sorted({str(line.get("asset_category")) for line in lines if line.get("asset_category")} ),
-                "asset_refs": sorted({str(line.get("asset_id") or line.get("planned_asset_id")) for line in lines if line.get("asset_id") or line.get("planned_asset_id")} ),
+                "departments": entities["departments"],
+                "asset_categories": entities["asset_categories"],
+                "asset_refs": entities["asset_refs"],
             },
             "allowed_intents": list(OntologyQuestionHarness.intent_evidence),
             "allowed_evidence": OntologyQuestionHarness.intent_evidence,
@@ -645,6 +648,26 @@ class WideTableQASkill:
                 "不得编造目录之外的资产、部门、类别、期间或场景。",
             ],
         }
+
+    def _entity_catalog(self, scenario_id: str) -> dict[str, list[str]]:
+        if self.tools.entity_catalog:
+            return self.tools.entity_catalog(scenario_id)
+        lines = self.tools.forecast_lines(scenario_id=scenario_id, limit=10000)
+        return {
+            "departments": sorted({str(line.get("department")) for line in lines if line.get("department")}),
+            "asset_categories": sorted({str(line.get("asset_category")) for line in lines if line.get("asset_category")}),
+            "asset_refs": sorted({str(line.get("asset_id") or line.get("planned_asset_id")) for line in lines if line.get("asset_id") or line.get("planned_asset_id")}),
+        }
+
+    def _annotate_trace_source(self, trace: list[dict[str, Any]]) -> None:
+        status = self.tools.graph_read_status() if self.tools.graph_read_status else {"active": False}
+        for item in trace:
+            if item.get("tool_name") in {"list_available_periods", "resolve_ontology_entities", "query_forecast_lines", "compare_forecast_periods", "get_rule_execution_evidence", "trace_asset_policy_path"}:
+                item["data_source"] = "Neo4j / Cypher" if status.get("active") else "SQLite / SQL fallback"
+                item["query_mode"] = "parameterized_read_only"
+            else:
+                item["data_source"] = "Harness deterministic aggregation"
+                item["query_mode"] = "in_memory_read_only"
 
     def _validate_question_plan(
         self,
@@ -686,10 +709,10 @@ class WideTableQASkill:
         }
         if scope["scenario_id"] != default_scope["scenario_id"]:
             return self._invalid_plan("当前会话不允许切换到未确认的场景。", default_scope, available_periods)
-        all_lines = self.tools.forecast_lines(scenario_id=scope["scenario_id"], limit=10000)
-        departments = {str(item.get("department")) for item in all_lines if item.get("department")}
-        categories = {str(item.get("asset_category")) for item in all_lines if item.get("asset_category")}
-        asset_refs = {str(item.get("asset_id") or item.get("planned_asset_id")) for item in all_lines if item.get("asset_id") or item.get("planned_asset_id")}
+        entities = self._entity_catalog(scope["scenario_id"])
+        departments = set(entities["departments"])
+        categories = set(entities["asset_categories"])
+        asset_refs = set(entities["asset_refs"])
         if scope["department"] and scope["department"] not in departments:
             return self._invalid_plan("模型识别的所属单位不在当前台账范围内。", default_scope, available_periods)
         if scope["asset_category"] and scope["asset_category"] not in categories:
@@ -1828,7 +1851,7 @@ class WideTableQASkill:
         policy = ((graph_reasoning or {}).get("policy_narrative") or {}).get("applicable_policy") or {}
         return [
             {"step": 1, "title_cn": "理解问题和筛选范围", "detail_cn": f"问题是“{question}”，当前宽表筛选范围为：{scope_text}。"},
-            {"step": 2, "title_cn": "读取折旧宽表底层明细", "detail_cn": f"从业务结果库读取 {facts.get('line_count', 0)} 条预测明细，合计折旧 {facts.get('total_depreciation', '0.00')}。"},
+            {"step": 2, "title_cn": "读取折旧宽表底层明细", "detail_cn": f"Harness 通过 Neo4j Cypher 读取 {facts.get('line_count', 0)} 条预测明细，合计折旧 {facts.get('total_depreciation', '0.00')}。"},
             {"step": 3, "title_cn": "定位主要贡献对象", "detail_cn": f"贡献最高的是 {top_asset.get('asset_ref', '无')}，折旧 {top_asset.get('depreciation', '0.00')}，类别为 {top_asset.get('asset_category_label_cn', '-')}。"},
             {"step": 4, "title_cn": "知识图谱追溯政策", "detail_cn": path.get("narrative_cn") or "没有找到资产到政策的完整图谱路径。"},
             {"step": 5, "title_cn": "解释折旧原因", "detail_cn": f"适用政策为 {policy.get('policy_label_cn') or top_asset.get('depreciation_policy_label_cn', '-')}，规则为 {policy.get('method_label_cn', '-')} / {policy.get('useful_life_months', '-')} 个月 / {policy.get('residual_rate_label_cn', '-')} / {policy.get('start_rule_label_cn', '-')}。"},
@@ -1870,7 +1893,7 @@ class WideTableQASkill:
             {
                 "step": 2,
                 "title_cn": "锁定宽表范围",
-                "detail_cn": f"本次只读取 {'、'.join(item for item in scope_items if item)} 的业务库预测明细，不使用前端硬编码结果。",
+                "detail_cn": f"Harness 通过 Neo4j Cypher 读取 {'、'.join(item for item in scope_items if item)} 的预测明细，不使用前端硬编码结果。",
             },
             {
                 "step": 3,

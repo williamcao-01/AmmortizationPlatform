@@ -133,21 +133,25 @@ class DemoState:
         self.explanation_harness = self._build_explanation_harness()
         self.wide_table_qa_skill = WideTableQASkill(
             tools=WideTableQATools(
-                forecast_lines=self.business_store.forecast_lines,
+                forecast_lines=self._harness_forecast_lines,
                 knowledge_graph_path=self.knowledge_graph_path,
                 policy_narrative=self.policy_narrative,
-                rule_executions=self.business_store.rule_executions,
-                available_periods=self._forecast_periods,
+                rule_executions=self._harness_rule_executions,
+                available_periods=self._harness_available_periods,
+                entity_catalog=self._harness_entity_catalog,
+                graph_read_status=self._harness_graph_read_status,
             ),
             provider=FallbackWideTableQAProvider(),
         )
         self.reverse_planning_skill = ReversePlanningSkill(
             tools=ReversePlanningTools(
-                forecast_lines=self.business_store.forecast_lines,
+                forecast_lines=self._harness_forecast_lines,
                 candidate_actions=self._reverse_candidate_actions,
                 simulate=self._simulate_reverse_assumptions,
                 ontology_path=self._reverse_ontology_paths,
                 catalog=self.reverse_planning_catalog,
+                eligible_asset_refs=self._harness_eligible_asset_refs,
+                graph_read_status=self._harness_graph_read_status,
             ),
             provider=FallbackWideTableQAProvider(),
         )
@@ -333,6 +337,53 @@ class DemoState:
             for line in self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
             if line.get("period")
         })
+
+    def _harness_forecast_lines(self, **filters: object) -> list[dict[str, object]]:
+        """Use Neo4j as the read model for agent evidence; SQLite remains the calculation store."""
+        if self.neo4j_store is not None:
+            return self.neo4j_store.forecast_lines(**filters)  # type: ignore[arg-type]
+        return self.business_store.forecast_lines(**filters)  # type: ignore[arg-type]
+
+    def _harness_available_periods(self, scenario_id: str) -> list[str]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.available_periods(scenario_id)
+        return self._forecast_periods(scenario_id)
+
+    def _harness_rule_executions(self, **filters: object) -> list[dict[str, object]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.rule_executions(**filters)  # type: ignore[arg-type]
+        return self.business_store.rule_executions(**filters)  # type: ignore[arg-type]
+
+    def _harness_entity_catalog(self, scenario_id: str) -> dict[str, list[str]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.entity_catalog(scenario_id)
+        lines = self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
+        return {
+            "companies": sorted({str(item.get("company")) for item in lines if item.get("company")}),
+            "departments": sorted({str(item.get("department")) for item in lines if item.get("department")}),
+            "asset_categories": sorted({str(item.get("asset_category")) for item in lines if item.get("asset_category")}),
+            "asset_refs": sorted({str(item.get("asset_id") or item.get("planned_asset_id")) for item in lines if item.get("asset_id") or item.get("planned_asset_id")}),
+        }
+
+    def _harness_eligible_asset_refs(self, *, scenario_id: str, scope_type: str, scope_value: str) -> list[str]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.eligible_asset_refs(
+                scenario_id=scenario_id,
+                scope_type=scope_type,
+                scope_value=scope_value,
+            )
+        return [
+            item.asset_id
+            for item in self.repository.load_fixed_assets()
+            if self._matches_reverse_scope(item, {"scope_type": scope_type, "scope_value": scope_value})
+        ]
+
+    def _harness_graph_read_status(self) -> dict[str, object]:
+        return {
+            "active": self.neo4j_store is not None,
+            "database": "Neo4j Community" if self.neo4j_store is not None else "SQLite",
+            "query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQL fallback",
+        }
 
     def summaries(self, query: dict[str, list[str]]) -> list[dict[str, object]]:
         return self.business_store.summaries(
@@ -565,7 +616,7 @@ class DemoState:
         return self.wide_table_qa_skill.catalog(self._str_arg(query, "scenario_id", "BASELINE"))
 
     def reverse_planning_catalog(self, scenario_id: str = "BASELINE") -> dict[str, object]:
-        lines = self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
+        lines = self._harness_forecast_lines(scenario_id=scenario_id, limit=10000)
         scopes: list[dict[str, object]] = []
         for scope_type, field, label in (("company", "company", "公司"), ("department", "department", "所属单位"), ("asset_category", "asset_category", "资产类别")):
             values = sorted({str(line.get(field) or "") for line in lines if line.get(field)})
@@ -595,7 +646,12 @@ class DemoState:
                 or (analysis.get("scope_type") == "asset_category" and asset.asset_category == analysis.get("scope_value")))
 
     def _reverse_candidate_actions(self, analysis: dict[str, object]) -> list[dict[str, object]]:
-        assets = [item for item in self.repository.load_fixed_assets() if self._matches_reverse_scope(item, analysis)]
+        eligible_refs = set(self._harness_eligible_asset_refs(
+            scenario_id=str(analysis.get("scenario_id") or "BASELINE"),
+            scope_type=str(analysis["scope_type"]),
+            scope_value=str(analysis["scope_value"]),
+        ))
+        assets = [item for item in self.repository.load_fixed_assets() if item.asset_id in eligible_refs]
         target_period = Month.parse(str(analysis["target_period"]))
         delta = Decimal(str(analysis["required_delta"]))
         direction = str(analysis.get("direction") or ("increase" if delta > 0 else "decrease"))
@@ -700,6 +756,12 @@ class DemoState:
                     method = "年限平均法" if asset.depreciation_code in ("Z111", "Z112") else "产量法" if asset.depreciation_code == "Z802" else "工作量法" if asset.depreciation_code == "Z901" else "折旧规则"
                     rule = next((item for item in recommendation.get("rule_execution_trace", []) if str(item.get("asset_ref") or "") == asset.asset_id), {})
                     branch = str(rule.get("branch_id") or "实际规则分支")
+                    graph_path = self.knowledge_graph_path({
+                        "from": [object_id("FixedAsset", asset.asset_id)],
+                        "to": [object_id("DepreciationPolicy", self._policy_id_for_asset(asset.asset_id, asset.depreciation_code))],
+                        "scenario_id": [str(context.get("scenario_id") or "BASELINE")],
+                    })
+                    graph_narrative = str(graph_path.get("narrative_cn") or "")
                     path_cn = f"{scope} -> 资产 {asset.asset_id} -> 折旧码 {asset.depreciation_code} -> {method} -> {branch} -> 临时假设 {template} -> {context.get('target_period')} 试算结果"
                     nodes = [scope, f"FixedAsset:{asset.asset_id}", f"DepreciationCode:{asset.depreciation_code}", method, branch, f"ScenarioAssumption:{template}", "ForecastLine"]
                 elif template == "production_driver":
@@ -711,8 +773,17 @@ class DemoState:
                 else:
                     path_cn = f"{scope} -> 可作用对象 {target} -> 临时假设 {template} -> {context.get('target_period')} 试算结果"
                     nodes = [scope, target, f"ScenarioAssumption:{template}", "ForecastLine"]
-                paths.append({"recommendation_number": recommendation.get("recommendation_number"), "action_template": template, "path_cn": path_cn, "nodes": nodes, "inferred": True})
+                paths.append({"recommendation_number": recommendation.get("recommendation_number"), "action_template": template, "path_cn": path_cn, "nodes": nodes, "inferred": True, "graph_path": graph_path if asset is not None else None, "graph_narrative_cn": graph_narrative if asset is not None else ""})
         return paths
+
+    def _policy_id_for_asset(self, asset_ref: str, fallback_code: str) -> str:
+        asset_object_id = object_id("FixedAsset", asset_ref)
+        if self.neo4j_store is not None:
+            policy_object_id = self.neo4j_store.policy_object_id_for_asset(asset_object_id)
+            if policy_object_id and ":" in policy_object_id:
+                return policy_object_id.split(":", maxsplit=1)[1]
+        code = next((item for item in self.repository.load_depreciation_codes() if item.code_id == fallback_code), None)
+        return code.policy_id if code else ""
 
     def _decorate_wide_table(self, table: dict[str, object]) -> dict[str, object]:
         catalog = self.wide_table_dimension_catalog()
@@ -1960,13 +2031,24 @@ class DemoState:
             scenario_id = str(execution["scenario_id"])
             asset_ref = str(execution["asset_ref"])
             period = str(execution["period"])
+            raw_inputs = execution.get("inputs")
+            if not isinstance(raw_inputs, dict):
+                try:
+                    raw_inputs = json.loads(str(execution.get("inputs_json") or "{}"))
+                except json.JSONDecodeError:
+                    raw_inputs = {}
+            graph_execution = {
+                key: value
+                for key, value in execution.items()
+                if key not in {"inputs", "inputs_json"}
+            }
             rows.append({
-                **execution,
+                **graph_execution,
                 "execution_id": f"{scenario_id}:{asset_ref}:{period}:{execution['id']}",
                 "scenario_object_id": object_id("Scenario", scenario_id),
                 "asset_object_id": object_id("FixedAsset", asset_ref),
                 "forecast_record_id": f"{scenario_id}:{asset_ref}:{period}",
-                "inputs_json": json.dumps(execution.get("inputs_json") or execution.get("inputs") or {}, ensure_ascii=False),
+                "rule_inputs_json": json.dumps(raw_inputs, ensure_ascii=False),
             })
         return rows
 

@@ -852,7 +852,7 @@ const renderReversePlanningResult = (result) => {
   const mode = result.qa_skill?.used_llm ? `实时大模型 · ${result.qa_skill.model || "DeepSeek"}` : "确定性规则结论";
   const plan = result.question_plan || {};
   const calls = result.model_calls || {};
-  const tools = asArray(result.harness?.tool_trace || result.tool_trace).map((item) => `<li><strong>${escapeHtml(item.label_cn || item.tool_name || "-")}</strong><span>${escapeHtml(item.tool_name || "-")}${item.result_shape ? ` · ${escapeHtml(Object.entries(item.result_shape).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join("，"))}` : ""}</span></li>`).join("");
+  const tools = asArray(result.harness?.tool_trace || result.tool_trace).map((item) => `<li><strong>${escapeHtml(item.label_cn || item.tool_name || "-")}</strong><span>${escapeHtml(item.data_source || "-")} · ${escapeHtml(item.tool_name || "-")}${item.result_shape ? ` · ${escapeHtml(Object.entries(item.result_shape).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join("，"))}` : ""}</span></li>`).join("");
   const callCards = [["阶段 1 · 目标理解", calls.question_understanding], ["阶段 2 · 业务表述", calls.answer_composition]].map(([label, call]) => {
     const status = call?.used_llm ? "已调用" : "未调用/已降级";
     const duration = call?.latency_ms ? `${(Number(call.latency_ms) / 1000).toFixed(2)} 秒` : (call?.fallback_reason || "无调用记录");
@@ -921,7 +921,7 @@ const renderWideQuestionResult = (result) => {
   const traceRows = asArray(result.harness?.tool_trace || qaSkill.tool_trace).map((item) => `
     <li>
       <strong>${escapeHtml(item.label_cn || item.tool_name || "-")}</strong>
-      <span>${escapeHtml(item.tool_name || "-")}${item.result_shape ? ` · ${escapeHtml(Object.entries(item.result_shape).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join("，"))}` : ""}</span>
+      <span>${escapeHtml(item.data_source || "-")} · ${escapeHtml(item.tool_name || "-")}${item.result_shape ? ` · ${escapeHtml(Object.entries(item.result_shape).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`).join("，"))}` : ""}</span>
     </li>
   `).join("");
   const pathRows = asArray(result.ontology_paths).map((item) => {
