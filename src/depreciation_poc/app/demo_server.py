@@ -2005,11 +2005,30 @@ class DemoState:
                 )
 
         ordered_objects = sorted(objects.values(), key=lambda item: item.object_id)
-        ordered_links = sorted(links.values(), key=lambda item: item.link_id)
+        active_object_types = {item.object_type for item in ordered_objects}
+        ordered_links = sorted(
+            (
+                item for item in links.values()
+                if item.source_object_id in objects and item.target_object_id in objects
+            ),
+            key=lambda item: item.link_id,
+        )
+        active_link_types = {item.link_type for item in ordered_links}
+        active_types = [item for item in OBJECT_TYPES if item.type_id in active_object_types]
+        active_links = [
+            item for item in LINK_TYPES
+            if item.type_id in active_link_types
+            and item.source_type in active_object_types
+            and item.target_type in active_object_types
+        ]
+        active_actions = [
+            item for item in ACTION_TYPES
+            if any(target_type in active_object_types for target_type in item.target_types)
+        ]
         self.business_store.save_ontology_model(
-            object_types=OBJECT_TYPES,
-            link_types=LINK_TYPES,
-            action_types=ACTION_TYPES,
+            object_types=active_types,
+            link_types=active_links,
+            action_types=active_actions,
             function_types=FUNCTION_TYPES,
             objects=ordered_objects,
             links=ordered_links,

@@ -1724,10 +1724,11 @@ const renderGraphExplorer = () => {
   }
   list.innerHTML = nodes.map((node) => {
     const id = node.id || node.object_id;
+    const assetRef = node.object_type === "FixedAsset" ? (node.properties?.asset_ref || node.technical_ref || "") : "";
     return `<button type="button" class="graph-object-row ${state.graphSelectedNodeId === id ? "selected" : ""}" data-graph-node-id="${escapeHtml(id)}">
       <span class="graph-object-type">${escapeHtml(node.type_label_cn || node.object_type || "业务对象")}</span>
-      <strong>${escapeHtml(node.label_cn || id)}</strong>
-      <small>${escapeHtml(node.subtitle_cn || node.technical_ref || "")}</small>
+      <strong>${escapeHtml(assetRef || node.label_cn || id)}</strong>
+      <small>${escapeHtml(assetRef ? (node.subtitle_cn || node.label_cn || "") : (node.subtitle_cn || node.technical_ref || ""))}</small>
     </button>`;
   }).join("") || `<p class="empty-note">没有匹配的业务对象。</p>`;
   list.querySelectorAll("[data-graph-node-id]").forEach((button) => {
