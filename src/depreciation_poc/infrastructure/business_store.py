@@ -580,6 +580,53 @@ class BusinessResultStore:
             tuple(values),
         )
 
+    def forecast_projection_rows(self) -> list[dict[str, Any]]:
+        """Return every persisted asset-month result for graph projection."""
+        return self._all(
+            """
+            select *
+            from forecast_lines
+            order by scenario_id, period, department, coalesce(asset_id, planned_asset_id)
+            """
+        )
+
+    def summary_projection_rows(self) -> list[dict[str, Any]]:
+        """Return every persisted aggregate result for graph projection."""
+        return self._all(
+            """
+            select *
+            from summary_lines
+            order by scenario_id, period, department, asset_category, depreciation_policy
+            """
+        )
+
+    def rule_execution_projection_rows(self) -> list[dict[str, Any]]:
+        return self._all(
+            """
+            select *
+            from rule_executions
+            order by scenario_id, period, asset_ref, id
+            """
+        )
+
+    def scenario_change_projection_rows(self) -> list[dict[str, Any]]:
+        return self._all(
+            """
+            select *
+            from what_if_changes
+            order by scenario_id, change_id
+            """
+        )
+
+    def attribution_projection_rows(self) -> list[dict[str, Any]]:
+        return self._all(
+            """
+            select *
+            from attribution_lines
+            order by scenario_id, period, object_id, id
+            """
+        )
+
     def wide_table(
         self,
         *,

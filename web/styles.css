@@ -1754,6 +1754,29 @@ th.sticky-col {
   padding: 14px 16px;
 }
 
+.graph-database-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  background: #f3faf8;
+}
+
+.graph-database-status strong {
+  color: #08776d;
+}
+
+.graph-database-status span + span::before {
+  content: "·";
+  margin-right: 9px;
+  color: #5e766f;
+}
+
 .graph-kpis article {
   padding: 10px 12px;
   border: 1px solid var(--line);

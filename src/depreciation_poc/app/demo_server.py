@@ -24,6 +24,7 @@ from depreciation_poc.infrastructure.business_store import BusinessResultStore
 from depreciation_poc.infrastructure.customer_excel_repository import CustomerExcelRepository
 from depreciation_poc.infrastructure.env_loader import load_local_env
 from depreciation_poc.infrastructure.graph_store import SQLiteGraphStore
+from depreciation_poc.infrastructure.neo4j_graph_store import Neo4jOntologyStore
 from depreciation_poc.ontology_model import (
     ACTION_TYPES,
     FUNCTION_TYPES,
@@ -122,6 +123,7 @@ class DemoState:
         self.repository = CustomerExcelRepository(customer_data_dir)
         self.graph_store = SQLiteGraphStore(graph_db_path)
         self.business_store = BusinessResultStore(business_db_path)
+        self.neo4j_store = self._open_neo4j_store()
         self.perspective = "BUDGET"
         snapshot_period = self.repository.source_summary().get("snapshot_period")
         self.budget_version = f"CUSTOMER-{snapshot_period}"
@@ -154,6 +156,27 @@ class DemoState:
     def close(self) -> None:
         self.graph_store.close()
         self.business_store.close()
+        if self.neo4j_store is not None:
+            self.neo4j_store.close()
+
+    @staticmethod
+    def _open_neo4j_store() -> Neo4jOntologyStore | None:
+        if os.environ.get("NEO4J_ENABLED", "false").lower() not in {"1", "true", "yes"}:
+            return None
+        uri = os.environ.get("NEO4J_URI", "").strip()
+        password = os.environ.get("NEO4J_PASSWORD", "")
+        if not uri or not password:
+            return None
+        try:
+            return Neo4jOntologyStore(
+                uri=uri,
+                username=os.environ.get("NEO4J_USERNAME", "neo4j"),
+                password=password,
+                database=os.environ.get("NEO4J_DATABASE", "neo4j"),
+            )
+        except Exception as exc:
+            logging.getLogger("depreciation_poc").warning("Neo4j unavailable; using SQLite ontology mirror: %s", exc)
+            return None
 
     def initialize(self) -> None:
         # Customer scenarios are durable business records. Bootstrap the SQLite stores
@@ -260,6 +283,7 @@ class DemoState:
             "business_db_updated_at": scenario["updated_at"] if scenario else None,
             "triple_count": self.graph_store.count_triples(),
             "inferred_triple_count": self.graph_store.count_triples(inferred=True),
+            "neo4j": self.neo4j_store.counts() if self.neo4j_store is not None else {"enabled": False},
         }
         if self.is_customer_data:
             status["snapshot"] = self.business_store.snapshot_status(self.snapshot_id)
@@ -1381,13 +1405,13 @@ class DemoState:
     def knowledge_graph(self, query: dict[str, list[str]]) -> dict[str, object]:
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
         focus = self._str_arg(query, "focus", "full")
-        objects = self.business_store.ontology_objects()
-        links = self.business_store.ontology_links()
+        objects, links = self._ontology_graph_records()
         nodes, edges = self._filter_ontology_graph(objects, links, focus)
         policy_matches = [self._policy_match_summary(item, scenario_id) for item in self._asset_source_records()]
         risks = self.business_store.anomalies(scenario_id=scenario_id)
         inferred_count = len([item for item in edges if item.get("inferred")])
         meta = self.business_store.ontology_meta()
+        neo4j_counts = self.neo4j_store.counts() if self.neo4j_store is not None else {}
         return {
             "summary": {
                 "scenario_id": scenario_id,
@@ -1397,12 +1421,19 @@ class DemoState:
                 "object_count": len(objects),
                 "link_count": len(links),
                 "inferred_link_count": inferred_count,
-                "triple_count": self.graph_store.count_triples(),
-                "inferred_triple_count": self.graph_store.count_triples(inferred=True),
+                "triple_count": neo4j_counts.get("link_count", self.graph_store.count_triples()),
+                "inferred_triple_count": neo4j_counts.get("inferred_link_count", self.graph_store.count_triples(inferred=True)),
                 "policy_match_count": len([item for item in policy_matches if item.get("applicable_policy")]),
                 "risk_count": len(risks),
                 "action_count": len(meta["action_types"]),
                 "function_count": len(meta["function_types"]),
+                "graph_database": "Neo4j Community" if self.neo4j_store is not None else "SQLite ontology mirror",
+                "graph_query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQLite",
+                "forecast_record_count": neo4j_counts.get("forecast_record_count", 0),
+                "forecast_summary_count": neo4j_counts.get("forecast_summary_count", 0),
+                "rule_execution_count": neo4j_counts.get("rule_execution_count", 0),
+                "scenario_change_count": neo4j_counts.get("scenario_change_count", 0),
+                "attribution_count": neo4j_counts.get("attribution_count", 0),
             },
             "object_types": meta["object_types"],
             "nodes": nodes,
@@ -1414,7 +1445,9 @@ class DemoState:
             "lineage": {
                 "source_data": "data/customer_snapshot/ 受控客户 Excel",
                 "object_store": str(self.business_db_path),
-                "graph_store": str(self.graph_db_path),
+                "graph_store": "Neo4j Community" if self.neo4j_store is not None else str(self.graph_db_path),
+                "graph_database": "neo4j" if self.neo4j_store is not None else "SQLite ontology mirror",
+                "graph_query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQLite",
                 "technical_triples_preview": self.graph_store.triples(limit=80),
             },
         }
@@ -1422,11 +1455,12 @@ class DemoState:
     def knowledge_graph_node(self, query: dict[str, list[str]]) -> dict[str, object]:
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
         node_id = self._str_arg(query, "id", "")
-        node = self.business_store.ontology_node(node_id)
+        node = self.neo4j_store.node(node_id) if self.neo4j_store is not None else self.business_store.ontology_node(node_id)
         if not node:
             return {"node": None, "message_cn": "没有找到该图谱对象。"}
-        adjacent = self.business_store.ontology_adjacent_links(node_id)
-        objects_by_id = {item["object_id"]: item for item in self.business_store.ontology_objects()}
+        adjacent = self.neo4j_store.adjacent_links(node_id) if self.neo4j_store is not None else self.business_store.ontology_adjacent_links(node_id)
+        objects, _links = self._ontology_graph_records()
+        objects_by_id = {item["object_id"]: item for item in objects}
         action_ids = set(default_actions_for(str(node["object_type"])))
         meta = self.business_store.ontology_meta()
         actions = [item for item in meta["action_types"] if item["type_id"] in action_ids]
@@ -1456,8 +1490,8 @@ class DemoState:
         from_id = self._str_arg(query, "from", "")
         to_id = self._str_arg(query, "to", "")
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
-        objects = {item["object_id"]: item for item in self.business_store.ontology_objects()}
-        links = self.business_store.ontology_links()
+        object_rows, links = self._ontology_graph_records()
+        objects = {item["object_id"]: item for item in object_rows}
         if from_id not in objects or to_id not in objects:
             return {
                 "scenario_id": scenario_id,
@@ -1467,7 +1501,7 @@ class DemoState:
                 "path_edges": [],
                 "narrative_cn": "没有找到完整路径，请确认起点和终点对象是否存在。",
             }
-        path_edges = self._bfs_path(from_id, to_id, links)
+        path_edges = self.neo4j_store.path(from_id, to_id) if self.neo4j_store is not None else self._bfs_path(from_id, to_id, links)
         path_nodes = []
         if path_edges:
             ids = [from_id]
@@ -1865,14 +1899,103 @@ class DemoState:
                     evidence={"rule_id": anomaly.get("rule_id"), "suggestion_cn": anomaly.get("suggestion_cn")},
                 )
 
+        ordered_objects = sorted(objects.values(), key=lambda item: item.object_id)
+        ordered_links = sorted(links.values(), key=lambda item: item.link_id)
         self.business_store.save_ontology_model(
             object_types=OBJECT_TYPES,
             link_types=LINK_TYPES,
             action_types=ACTION_TYPES,
             function_types=FUNCTION_TYPES,
-            objects=sorted(objects.values(), key=lambda item: item.object_id),
-            links=sorted(links.values(), key=lambda item: item.link_id),
+            objects=ordered_objects,
+            links=ordered_links,
         )
+        if self.neo4j_store is not None:
+            self.neo4j_store.sync(objects=ordered_objects, links=ordered_links)
+            self.neo4j_store.sync_business_results(
+                forecast_lines=self._neo4j_forecast_projection_rows(),
+                summary_lines=self._neo4j_summary_projection_rows(),
+                rule_executions=self._neo4j_rule_execution_projection_rows(),
+                scenario_changes=self._neo4j_scenario_change_projection_rows(),
+                attributions=self._neo4j_attribution_projection_rows(),
+            )
+
+    def _neo4j_forecast_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for line in self.business_store.forecast_projection_rows():
+            asset_ref = str(line.get("asset_id") or line.get("planned_asset_id") or "")
+            if not asset_ref:
+                continue
+            object_type = "PlannedAsset" if line.get("planned_asset_id") else "FixedAsset"
+            scenario_id = str(line["scenario_id"])
+            period = str(line["period"])
+            rows.append({
+                **line,
+                "record_id": f"{scenario_id}:{asset_ref}:{period}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id(object_type, asset_ref),
+            })
+        return rows
+
+    def _neo4j_summary_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for line in self.business_store.summary_projection_rows():
+            scenario_id = str(line["scenario_id"])
+            summary_id = ":".join(
+                str(line.get(field) or "")
+                for field in (
+                    "scenario_id", "period", "department", "cost_center", "profit_center",
+                    "asset_category", "asset_source_type", "event_type", "depreciation_policy",
+                )
+            )
+            rows.append({
+                **line,
+                "summary_id": summary_id,
+                "scenario_object_id": object_id("Scenario", scenario_id),
+            })
+        return rows
+
+    def _neo4j_rule_execution_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for execution in self.business_store.rule_execution_projection_rows():
+            scenario_id = str(execution["scenario_id"])
+            asset_ref = str(execution["asset_ref"])
+            period = str(execution["period"])
+            rows.append({
+                **execution,
+                "execution_id": f"{scenario_id}:{asset_ref}:{period}:{execution['id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id("FixedAsset", asset_ref),
+                "forecast_record_id": f"{scenario_id}:{asset_ref}:{period}",
+                "inputs_json": json.dumps(execution.get("inputs_json") or execution.get("inputs") or {}, ensure_ascii=False),
+            })
+        return rows
+
+    def _neo4j_scenario_change_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for change in self.business_store.scenario_change_projection_rows():
+            scenario_id = str(change["scenario_id"])
+            target_type = str(change.get("target_type") or "FixedAsset")
+            rows.append({
+                **change,
+                "change_record_id": f"{scenario_id}:{change['change_id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id(target_type, str(change["target_id"])),
+            })
+        return rows
+
+    def _neo4j_attribution_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for attribution in self.business_store.attribution_projection_rows():
+            scenario_id = str(attribution["scenario_id"])
+            object_type = str(attribution.get("object_type") or "FixedAsset")
+            rows.append({
+                **attribution,
+                "attribution_id": f"{scenario_id}:{attribution['period']}:{attribution['object_id']}:{attribution['id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "compared_scenario_object_id": object_id("Scenario", str(attribution["compared_to_scenario_id"])),
+                "asset_object_id": object_id(object_type, str(attribution["object_id"])),
+            })
+        return rows
 
     def _put_organization_objects(self, objects: dict[str, ObjectInstance], department: str, cost_center: str, profit_center: str) -> None:
         for object_type, value, label in (
@@ -1947,6 +2070,11 @@ class DemoState:
             sorted(selected_nodes, key=lambda item: (str(item["object_type"]), str(item["id"]))),
             sorted(edges, key=lambda item: str(item["id"])),
         )
+
+    def _ontology_graph_records(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.objects(), self.neo4j_store.links()
+        return self.business_store.ontology_objects(), self.business_store.ontology_links()
 
     def _graph_node_payload(self, row: dict[str, object]) -> dict[str, object]:
         object_type = str(row["object_type"])

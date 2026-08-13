@@ -1845,13 +1845,21 @@ const positionGraphNodes = (nodes) => {
 };
 
 const renderGraphKpis = (summary) => {
+  const database = summary.graph_database || "图数据库未连接";
+  const engine = summary.graph_query_engine || "-";
+  const records = summary.forecast_record_count ?? 0;
+  const summaries = summary.forecast_summary_count ?? 0;
+  const executions = summary.rule_execution_count ?? 0;
+  const changes = summary.scenario_change_count ?? 0;
+  const attributions = summary.attribution_count ?? 0;
+  el("graphDatabaseStatus").innerHTML = `<strong>${escapeHtml(database)}</strong><span>${escapeHtml(engine)}</span><span>已投影 ${escapeHtml(records)} 条逐月计算、${escapeHtml(summaries)} 条汇总、${escapeHtml(executions)} 条规则执行、${escapeHtml(changes)} 条场景变更和 ${escapeHtml(attributions)} 条归因记录</span>`;
   const items = [
     ["对象数", summary.node_count ?? summary.object_count ?? 0],
     ["关系数", summary.edge_count ?? summary.link_count ?? 0],
     ["推理关系", summary.inferred_link_count ?? summary.inferred_triple_count ?? 0],
-    ["异常数", summary.risk_count ?? 0],
-    ["动作数", summary.action_count ?? 0],
-    ["函数数", summary.function_count ?? 0],
+    ["逐月记录", records],
+    ["汇总记录", summaries],
+    ["场景动作", summary.action_count ?? 0],
   ];
   el("graphKpis").innerHTML = items.map(([label, value]) => `
     <article>

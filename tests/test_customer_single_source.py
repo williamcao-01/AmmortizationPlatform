@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -17,13 +18,14 @@ class CustomerSingleSourceTest(unittest.TestCase):
     def make_state(self, root: Path) -> DemoState:
         repository = CustomerExcelRepository(DATA_DIR)
         start_period = Month.parse(repository.source_summary()["snapshot_period"]).add(1)
-        return DemoState(
-            customer_data_dir=DATA_DIR,
-            graph_db_path=root / "graph.sqlite",
-            business_db_path=root / "business.sqlite",
-            start_period=start_period,
-            months=repository.verified_forecast_months(start_period, maximum=6),
-        )
+        with patch.dict("os.environ", {"NEO4J_ENABLED": "false"}):
+            return DemoState(
+                customer_data_dir=DATA_DIR,
+                graph_db_path=root / "graph.sqlite",
+                business_db_path=root / "business.sqlite",
+                start_period=start_period,
+                months=repository.verified_forecast_months(start_period, maximum=6),
+            )
 
     def test_only_current_workbooks_and_covered_periods_are_used(self):
         with tempfile.TemporaryDirectory() as temporary:
