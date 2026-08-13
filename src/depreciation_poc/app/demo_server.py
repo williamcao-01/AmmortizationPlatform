@@ -1550,7 +1550,7 @@ class DemoState:
                         "parent_id": category.parent_id,
                         "parent_label_cn": category_label(category.parent_id),
                     },
-                    source_system="asset_categories.csv",
+                    source_system="客户资产台账 / 资产相关配置表",
                     technical_ref=category.category_id,
                 )
             )
@@ -1563,7 +1563,7 @@ class DemoState:
                     "继承上级类别",
                     f"{category_label(category.category_id)} 属于 {category_label(category.parent_id)}，可继承上级类别的政策覆盖。",
                     inferred=True,
-                    evidence={"source": "asset_categories.csv", "parent_id": category.parent_id},
+                    evidence={"source": "客户资产相关配置表", "parent_id": category.parent_id},
                 )
 
         for policy in self.repository.load_depreciation_policies():
@@ -1591,7 +1591,7 @@ class DemoState:
                         "start_rule": policy.start_rule,
                         "start_rule_label_cn": start_rule_label(policy.start_rule),
                     },
-                    source_system="depreciation_policies.csv",
+                    source_system="客户资产相关配置表",
                     technical_ref=policy.policy_id,
                 )
             )
@@ -1619,7 +1619,7 @@ class DemoState:
                         "policy_id": code.policy_id,
                         "policy_label_cn": policy_label(code.policy_id),
                     },
-                    source_system="depreciation_codes.csv",
+                    source_system="客户资产相关配置表",
                     technical_ref=code.code_id,
                 )
             )
@@ -1629,7 +1629,7 @@ class DemoState:
                 object_id("DepreciationPolicy", code.policy_id),
                 "折旧码映射政策",
                 f"{depreciation_code_label(code.code_id)} 映射到 {policy_label(code.policy_id)}。",
-                evidence={"source": "depreciation_codes.csv"},
+                evidence={"source": "客户资产相关配置表"},
             )
             policy = next((item for item in self.repository.load_depreciation_policies() if item.policy_id == code.policy_id), None)
             if policy:
@@ -1659,7 +1659,7 @@ class DemoState:
                         "in_service_date": str(asset.in_service_date) if asset.in_service_date else None,
                         "status": asset.status,
                     },
-                    source_system="fixed_assets.csv",
+                    source_system="客户资产明细表",
                     technical_ref=asset.asset_id,
                     metrics=baseline_asset_amounts.get(asset.asset_id, {}),
                 )
@@ -1716,7 +1716,7 @@ class DemoState:
                         "budget_version": asset.budget_version,
                         "status": asset.status,
                     },
-                    source_system="planned_assets.csv",
+                    source_system="当前测算场景假设",
                     technical_ref=asset.planned_asset_id,
                     metrics=baseline_asset_amounts.get(asset.planned_asset_id, {}),
                 )
@@ -1743,7 +1743,7 @@ class DemoState:
                         "budget_version": event.budget_version,
                         "description": event.description,
                     },
-                    source_system="asset_events.csv",
+                    source_system="当前测算场景假设",
                     technical_ref=event.event_id,
                 )
             )

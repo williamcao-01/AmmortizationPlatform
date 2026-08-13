@@ -6,6 +6,7 @@ const state = {
   assetCards: [],
   assetWorkbenchCards: [],
   graph: null,
+  graphSelectedNodeId: null,
   ruleCatalog: null,
   scenarioAssetDetail: null,
   scenarioDefaultPeriod: "",
@@ -1658,23 +1659,22 @@ const loadDetails = async () => {
 };
 
 const loadKnowledgeGraph = async () => {
-  const focus = el("graphFocus")?.value || "business";
+  const focus = "full";
   el("graphCanvas").textContent = "正在加载知识图谱...";
   try {
     state.graph = await api(`/api/knowledge-graph?scenario_id=${encodeURIComponent(state.scenarioId)}&focus=${encodeURIComponent(focus)}`);
-    hydrateGraphTypeFilter(state.graph.object_types || []);
-    renderKnowledgeGraph(state.graph);
+    hydrateGraphObjectTypeFilter(state.graph.object_types || []);
+    renderGraphExplorer();
   } catch (error) {
     el("graphCanvas").innerHTML = `<p class="empty-note">知识图谱加载失败：${escapeHtml(error.message)}</p>`;
     el("graphKpis").innerHTML = "";
     el("graphNodeDetail").textContent = "暂无节点详情";
-    el("graphLineage").innerHTML = "";
+    el("graphObjectList").innerHTML = "";
   }
 };
 
-const hydrateGraphTypeFilter = (objectTypes) => {
-  const select = el("graphTypeFilter");
-  if (!select) return;
+const hydrateGraphObjectTypeFilter = (objectTypes) => {
+  const select = el("graphObjectType");
   const current = select.value;
   select.innerHTML = `<option value="">全部对象</option>`;
   asArray(objectTypes).forEach((item) => {
@@ -1684,6 +1684,53 @@ const hydrateGraphTypeFilter = (objectTypes) => {
     select.appendChild(option);
   });
   select.value = current && [...select.options].some((option) => option.value === current) ? current : "";
+};
+
+const filteredGraphNodes = () => {
+  const rawNodes = asArray(state.graph?.nodes);
+  const selectedType = el("graphObjectType")?.value || "";
+  const keyword = (el("graphObjectSearch")?.value || "").trim().toLowerCase();
+  return rawNodes.filter((node) => {
+    if (selectedType && node.object_type !== selectedType) return false;
+    if (!keyword) return true;
+    const text = [
+      node.id, node.label_cn, node.subtitle_cn, node.technical_ref,
+      ...Object.values(node.properties || {}),
+    ].join(" ").toLowerCase();
+    return text.includes(keyword);
+  });
+};
+
+const renderGraphExplorer = () => {
+  const nodes = filteredGraphNodes();
+  renderGraphKpis(state.graph?.summary || {});
+  el("graphObjectCount").textContent = `显示 ${nodes.length} / ${asArray(state.graph?.nodes).length}`;
+  const list = el("graphObjectList");
+  list.innerHTML = nodes.map((node) => {
+    const id = node.id || node.object_id;
+    return `<button type="button" class="graph-object-row ${state.graphSelectedNodeId === id ? "selected" : ""}" data-graph-node-id="${escapeHtml(id)}">
+      <span class="graph-object-type">${escapeHtml(node.type_label_cn || node.object_type || "业务对象")}</span>
+      <strong>${escapeHtml(node.label_cn || id)}</strong>
+      <small>${escapeHtml(node.subtitle_cn || node.technical_ref || "")}</small>
+    </button>`;
+  }).join("") || `<p class="empty-note">没有匹配的业务对象。</p>`;
+  list.querySelectorAll("[data-graph-node-id]").forEach((button) => {
+    button.addEventListener("click", () => selectGraphNode(button.dataset.graphNodeId));
+  });
+  if (state.graphSelectedNodeId && nodes.some((node) => (node.id || node.object_id) === state.graphSelectedNodeId)) {
+    return;
+  }
+  if (nodes[0]) selectGraphNode(nodes[0].id || nodes[0].object_id);
+  else renderGraphFocus(null);
+};
+
+const selectGraphNode = async (nodeId) => {
+  if (!nodeId) return;
+  state.graphSelectedNodeId = nodeId;
+  document.querySelectorAll(".graph-object-row").forEach((item) => {
+    item.classList.toggle("selected", item.dataset.graphNodeId === nodeId);
+  });
+  await loadGraphNodeDetail(nodeId);
 };
 
 const renderKnowledgeGraph = (data) => {
@@ -1817,6 +1864,7 @@ const renderGraphKpis = (summary) => {
 const loadGraphNodeDetail = async (nodeId) => {
   if (!nodeId) {
     el("graphNodeDetail").textContent = "暂无节点详情";
+    renderGraphFocus(null);
     return;
   }
   try {
@@ -1825,6 +1873,58 @@ const loadGraphNodeDetail = async (nodeId) => {
   } catch (error) {
     el("graphNodeDetail").innerHTML = `<p class="empty-note">节点详情加载失败：${escapeHtml(error.message)}</p>`;
   }
+};
+
+const renderGraphFocus = (detail) => {
+  if (!detail?.node) {
+    el("graphSelectionHint").textContent = "从左侧选择一个业务对象";
+    el("graphCanvas").innerHTML = `<p class="empty-note">选择对象后，显示其直接业务关系。</p>`;
+    return;
+  }
+  const node = detail.node;
+  const related = asArray(detail.related_nodes);
+  const visible = related.slice(0, 14);
+  const width = 840;
+  const height = 540;
+  const center = { x: 420, y: 270 };
+  const radius = Math.min(190, Math.max(118, visible.length * 14));
+  const positions = visible.map((item, index) => {
+    const angle = (Math.PI * 2 * index / Math.max(visible.length, 1)) - Math.PI / 2;
+    return {
+      item,
+      x: Math.round(center.x + Math.cos(angle) * radius),
+      y: Math.round(center.y + Math.sin(angle) * radius * 0.76),
+    };
+  });
+  const edgeMarkup = positions.map(({ item, x, y }) => `
+    <g class="graph-focus-edge">
+      <line x1="${center.x}" y1="${center.y}" x2="${x}" y2="${y}"></line>
+      <text x="${Math.round((center.x + x) / 2)}" y="${Math.round((center.y + y) / 2)}">${escapeHtml(truncate(item.edge?.label_cn || "关联", 12))}</text>
+    </g>`).join("");
+  const neighborMarkup = positions.map(({ item, x, y }) => {
+    const relatedNode = item.node || {};
+    const id = relatedNode.object_id || relatedNode.id;
+    return `<g class="graph-focus-node neighbor" data-focus-node-id="${escapeHtml(id)}" transform="translate(${x} ${y})">
+      <rect x="-70" y="-26" width="140" height="52" rx="6"></rect>
+      <text y="-3">${escapeHtml(truncate(relatedNode.label_cn || id, 17))}</text>
+      <text y="15" class="node-type">${escapeHtml(truncate(relatedNode.object_type || "业务对象", 15))}</text>
+    </g>`;
+  }).join("");
+  el("graphSelectionHint").textContent = related.length > visible.length
+    ? `显示 ${visible.length} / ${related.length} 条直接关系；右侧可查看全部关系。`
+    : `共 ${related.length} 条直接业务关系。`;
+  el("graphCanvas").innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="所选业务对象的关系图">
+    ${edgeMarkup}
+    <g class="graph-focus-node center" transform="translate(${center.x} ${center.y})">
+      <rect x="-94" y="-34" width="188" height="68" rx="7"></rect>
+      <text y="-5">${escapeHtml(truncate(node.label_cn || node.object_id, 22))}</text>
+      <text y="17" class="node-type">${escapeHtml(node.object_type || "业务对象")}</text>
+    </g>
+    ${neighborMarkup}
+  </svg>`;
+  el("graphCanvas").querySelectorAll("[data-focus-node-id]").forEach((element) => {
+    element.addEventListener("click", () => selectGraphNode(element.dataset.focusNodeId));
+  });
 };
 
 const renderGraphNodeDetail = (detail) => {
@@ -1840,34 +1940,34 @@ const renderGraphNodeDetail = (detail) => {
   const functions = asArray(detail.functions);
   const risks = asArray(detail.risks);
   const nodeId = node.id || node.object_id;
+  renderGraphFocus(detail);
   el("graphNodeDetail").innerHTML = `
-    <strong>${escapeHtml(node.label_cn || node.label || node.name || node.id)}</strong>
-    <p>${escapeHtml(node.subtitle_cn || firstValue(node, ["description_cn", "description", "summary"], ""))}</p>
-    <dl>
-      <dt>类型</dt><dd>${escapeHtml(node.type_label_cn || node.type_cn || node.object_type || node.type || "-")}</dd>
-      <dt>标识</dt><dd>${escapeHtml(nodeId || "-")}</dd>
-      <dt>来源</dt><dd>${escapeHtml(node.source_system || "-")}</dd>
-    </dl>
-    <h4>业务属性</h4>
-    <div class="mini-list">${renderGraphKeyValues(properties)}</div>
-    <h4>预测摘要</h4>
-    <div class="mini-list">${renderGraphKeyValues(metrics)}</div>
-    <h4>关联对象</h4>
-    <div class="chip-list">${related.slice(0, 8).map((item) => {
+    <section class="graph-detail-title">
+      <span>${escapeHtml(node.object_type || "业务对象")}</span>
+      <strong>${escapeHtml(node.label_cn || node.label || node.name || node.id)}</strong>
+      <p>${escapeHtml(node.subtitle_cn || firstValue(node, ["description_cn", "description", "summary"], ""))}</p>
+    </section>
+    <section class="graph-detail-section">
+      <h4>对象标识</h4>
+      <div class="graph-meta-list"><span><b>对象 ID</b>${escapeHtml(nodeId || "-")}</span><span><b>来源</b>${escapeHtml(node.source_system || "-")}</span><span><b>业务引用</b>${escapeHtml(node.technical_ref || "-")}</span></div>
+    </section>
+    <section class="graph-detail-section"><h4>全部业务属性</h4><div class="mini-list">${renderGraphKeyValues(properties)}</div></section>
+    <section class="graph-detail-section"><h4>预测与计算指标</h4><div class="mini-list">${renderGraphKeyValues(metrics)}</div></section>
+    <section class="graph-detail-section"><h4>全部直接关系 (${related.length})</h4>
+    <div class="graph-relation-list">${related.map((item) => {
       const edge = item.edge || {};
       const relatedNode = item.node || {};
-      return `<button type="button" class="graph-related" data-node-id="${escapeHtml(relatedNode.object_id || relatedNode.id)}">${escapeHtml(edge.label_cn || "关联")} · ${escapeHtml(relatedNode.label_cn || relatedNode.id)}</button>`;
-    }).join("") || `<span>暂无关联对象</span>`}</div>
-    <h4>可执行动作</h4>
-    <div class="chip-list">${actions.map((action) => `<button type="button" class="graph-action" data-action="${escapeHtml(action.type_id)}" data-node-id="${escapeHtml(nodeId)}">${escapeHtml(action.label_cn)}</button>`).join("") || `<span>暂无动作</span>`}</div>
-    <h4>可调用函数</h4>
-    <div class="function-list">${functions.map((fn) => `<article><strong>${escapeHtml(fn.label_cn)}</strong><span>${escapeHtml(fn.description_cn)}</span></article>`).join("") || `<p class="empty-note">暂无函数</p>`}</div>
-    ${risks.length ? `<h4>风险</h4><div class="risk-list">${risks.map((risk) => `<article class="risk-item"><strong>${escapeHtml(risk.severity_label_cn || risk.severity || "提示")}</strong><p>${escapeHtml(risk.message_cn || risk.message || "")}</p></article>`).join("")}</div>` : ""}
+      return `<button type="button" class="graph-related" data-node-id="${escapeHtml(relatedNode.object_id || relatedNode.id)}"><b>${escapeHtml(edge.label_cn || "关联")}</b><span>${escapeHtml(relatedNode.label_cn || relatedNode.id)}</span><small>${escapeHtml(edge.business_text || "")}</small></button>`;
+    }).join("") || `<span>暂无关联对象</span>`}</div></section>
+    ${(actions.length || functions.length || risks.length) ? `<details class="graph-advanced"><summary>计算与治理信息</summary>
+      ${actions.length ? `<div class="chip-list">${actions.map((action) => `<button type="button" class="graph-action" data-action="${escapeHtml(action.type_id)}" data-node-id="${escapeHtml(nodeId)}">${escapeHtml(action.label_cn)}</button>`).join("")}</div>` : ""}
+      ${functions.length ? `<div class="function-list">${functions.map((fn) => `<article><strong>${escapeHtml(fn.label_cn)}</strong><span>${escapeHtml(fn.description_cn)}</span></article>`).join("")}</div>` : ""}
+      ${risks.length ? `<div class="risk-list">${risks.map((risk) => `<article class="risk-item"><strong>${escapeHtml(risk.severity_label_cn || risk.severity || "提示")}</strong><p>${escapeHtml(risk.message_cn || risk.message || "")}</p></article>`).join("")}</div>` : ""}
+    </details>` : ""}
   `;
   el("graphNodeDetail").querySelectorAll(".graph-related").forEach((button) => {
     button.addEventListener("click", () => {
-      markGraphSelection(button.dataset.nodeId);
-      loadGraphNodeDetail(button.dataset.nodeId);
+      selectGraphNode(button.dataset.nodeId);
     });
   });
   el("graphNodeDetail").querySelectorAll(".graph-action").forEach((button) => {
@@ -1878,7 +1978,7 @@ const renderGraphNodeDetail = (detail) => {
 const renderGraphKeyValues = (object) => {
   const entries = Object.entries(object || {}).filter(([, value]) => value !== null && value !== undefined && value !== "");
   if (!entries.length) return `<span>暂无数据</span>`;
-  return entries.slice(0, 10).map(([key, value]) => `
+  return entries.map(([key, value]) => `
     <span><b>${escapeHtml(labels[key] || categoryLabels[key] || key)}</b>${escapeHtml(displayValue(value))}</span>
   `).join("");
 };
@@ -2082,6 +2182,7 @@ const showView = async (view) => {
   const titles = {
     overview: "预算总览",
     assets: "资产工作台",
+    graph: "知识图谱",
     wide: "折旧宽表",
     whatif: "What-if 测算",
     reverse: "反向推演",
@@ -2099,6 +2200,7 @@ const showView = async (view) => {
     showWhatIfList();
   }
   if (view === "assets") await loadAssetWorkbench();
+  if (view === "graph") await loadKnowledgeGraph();
   if (view === "reverse") state.reverseCatalog = await softApi("/api/reverse-planning/catalog", null);
   if (view === "compare") await loadScenarioCompare();
 };
@@ -2138,6 +2240,11 @@ el("wideQuestionInput").addEventListener("keydown", (event) => {
 el("reverseQuestionBtn").addEventListener("click", askReversePlanning);
 el("reverseQuestionInput").addEventListener("keydown", (event) => {
   if (event.key === "Enter") askReversePlanning();
+});
+el("graphObjectSearch").addEventListener("input", renderGraphExplorer);
+el("graphObjectType").addEventListener("change", () => {
+  state.graphSelectedNodeId = null;
+  renderGraphExplorer();
 });
 el("scenarioForm").addEventListener("submit", submitScenario);
 el("newScenarioBtn").addEventListener("click", async () => {

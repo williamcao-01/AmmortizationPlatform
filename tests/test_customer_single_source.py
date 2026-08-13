@@ -81,6 +81,27 @@ class CustomerSingleSourceTest(unittest.TestCase):
             finally:
                 state.close()
 
+    def test_knowledge_graph_contains_only_customer_business_objects_and_exposes_node_details(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            try:
+                graph = state.knowledge_graph({"scenario_id": ["BASELINE"], "focus": ["full"]})
+                assets = [item for item in graph["nodes"] if item["object_type"] == "FixedAsset"]
+                self.assertEqual(len(assets), 279)
+                self.assertFalse(any(str(item["technical_ref"]).startswith(("PA-", "FA-")) for item in assets))
+                self.assertTrue(all("客户" in str(item["source_system"]) for item in assets))
+                self.assertGreater(graph["summary"]["edge_count"], 0)
+
+                detail = state.knowledge_graph_node({
+                    "scenario_id": ["BASELINE"],
+                    "id": [str(assets[0]["id"])],
+                })
+                self.assertEqual(detail["node"]["object_id"], assets[0]["id"])
+                self.assertTrue(detail["related_nodes"])
+                self.assertIn("asset_ref", detail["node"]["properties"])
+            finally:
+                state.close()
+
     def test_scenario_compare_supports_overview_and_two_level_drilldown(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = self.make_state(Path(temporary))
