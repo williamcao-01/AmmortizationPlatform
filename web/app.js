@@ -7,8 +7,12 @@ const state = {
   assetWorkbenchCards: [],
   graph: null,
   ruleCatalog: null,
+  scenarioAssetDetail: null,
+  scenarioDefaultPeriod: "",
+  scenarioEditingId: null,
   wideCatalog: null,
   wideExpanded: new Set(),
+  compareExpanded: new Set(),
   wideQuestionConversationId: null,
   wideQuestionPending: false,
   reversePlanningConversationId: null,
@@ -229,9 +233,7 @@ const loadSnapshotStatus = async () => {
   const lastForecast = periods.at(-1) || firstForecast;
   el("comparePeriodFrom").value = snapshot.actual_snapshot_period || snapshot.snapshot_period || firstForecast;
   el("comparePeriodTo").value = lastForecast;
-  el("scenarioPeriod").value = firstForecast;
-  el("scenarioInServiceDate").value = firstForecast ? `${firstForecast}-01` : "";
-  el("scenarioCompany").value = "";
+  state.scenarioDefaultPeriod = firstForecast;
   sourceStatus({ snapshot, scenario_id: state.scenarioId });
 };
 
@@ -302,6 +304,7 @@ const loadAssetCards = async () => {
 const normalizeAssetCard = (card) => ({
   assetRef: firstValue(card, ["asset_ref", "asset_id", "planned_asset_id", "object_id", "id"]),
   name: firstValue(card, ["asset_name", "name", "title", "asset_title"], firstValue(card, ["asset_ref", "id"])),
+  company: firstValue(card, ["company", "company_code"], ""),
   department: firstValue(card, ["department", "department_name", "cost_center"], "-"),
   category: firstValue(card, ["asset_category", "category", "category_code"], "-"),
   source: firstValue(card, ["asset_source_type", "source_type", "source"], "-"),
@@ -309,6 +312,11 @@ const normalizeAssetCard = (card) => ({
   isBlocking: Boolean(firstValue(card, ["is_blocking", "blocking"], false)),
   riskCount: Number(firstValue(card, ["risk_count", "anomaly_count"], 0)),
   policy: firstValue(card, ["depreciation_policy_label_cn", "policy_label_cn", "policy_name", "applicable_policy", "depreciation_policy", "policy_id"], "-"),
+  depreciationCode: firstValue(card, ["depreciation_code"], ""),
+  depreciationCodeLabel: firstValue(card, ["depreciation_code_label_cn", "depreciation_code"], "-"),
+  depreciationMethod: firstValue(card, ["depreciation_method"], ""),
+  depreciationMethodLabel: firstValue(card, ["depreciation_method_label_cn", "depreciation_method"], "-"),
+  baseAmount: firstValue(card, ["base_amount", "original_or_planned_amount"], 0),
   depreciation: firstValue(card, [
     "forecast_depreciation_total",
     "total_depreciation",
@@ -651,6 +659,19 @@ const loadWideDimensionCatalog = async () => {
     }
     if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
   }
+  for (const id of ["compareDimension1", "compareDimension2"]) {
+    const select = el(id);
+    const current = select.value;
+    select.innerHTML = `<option value="">不下钻</option>`;
+    for (const dimension of dimensions) {
+      const option = document.createElement("option");
+      option.value = dimension.id;
+      option.textContent = dimension.label_cn;
+      option.title = dimension.description_cn || dimension.label_cn;
+      select.appendChild(option);
+    }
+    if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
+  }
 };
 
 const selectedWideDimensions = () => {
@@ -676,6 +697,22 @@ const normalizeWideDimensions = () => {
     }
     seen.add(select.value);
   }
+};
+
+const selectedCompareDimensions = () => {
+  const values = [];
+  for (const id of ["compareDimension1", "compareDimension2"]) {
+    const value = el(id).value;
+    if (!value) break;
+    values.push(value);
+  }
+  return values;
+};
+
+const normalizeCompareDimensions = () => {
+  const first = el("compareDimension1");
+  const second = el("compareDimension2");
+  if (!first.value || second.value === first.value) second.value = "";
 };
 
 const loadWideTable = async () => {
@@ -1049,52 +1086,309 @@ const loadAnomalies = async () => {
 
 const loadRuleCatalog = async () => {
   state.ruleCatalog = await api("/api/rule-catalog");
-  const select = el("ruleTemplate");
-  if (!select) return;
-  select.innerHTML = "";
-  for (const method of state.ruleCatalog.methods || []) {
-    for (const template of method.templates || []) {
-      const option = document.createElement("option");
-      option.value = template.id;
-      option.textContent = `${method.label_cn} · ${template.label_cn}`;
-      option.title = template.description_cn;
-      select.appendChild(option);
-    }
+  await refreshScenarioAssetComposer();
+};
+
+const showWhatIfList = () => {
+  el("whatIfListView").hidden = false;
+  el("whatIfEditorView").hidden = true;
+};
+
+const showWhatIfEditor = () => {
+  el("whatIfListView").hidden = true;
+  el("whatIfEditorView").hidden = false;
+};
+
+const resetScenarioEditor = () => {
+  state.scenarioEditingId = null;
+  state.scenarioDraftAssumptions = [];
+  state.scenarioAssetDetail = null;
+  el("whatIfEditorTitle").textContent = "新建测算场景";
+  el("scenarioName").value = "";
+  el("scenarioDescription").value = "";
+  el("scenarioBase").value = "BASELINE";
+  el("scenarioBase").disabled = false;
+  el("whatIfResult").innerHTML = "";
+  hydrateScenarioAssetOptions();
+  renderScenarioAssumptions();
+};
+
+const loadWhatIfScenarioList = async () => {
+  const scenarios = state.scenarios.filter((scenario) => scenario.scenario_id !== "BASELINE");
+  const tbody = el("whatIfScenarioList");
+  el("whatIfScenarioStatus").textContent = scenarios.length
+    ? `已保存 ${scenarios.length} 个测算场景。`
+    : "暂未创建测算场景。点击“新建测算场景”开始。";
+  tbody.innerHTML = scenarios.map((scenario) => `
+    <tr>
+      <td><strong>${escapeHtml(scenario.scenario_name || scenario.scenario_id)}</strong><small>${escapeHtml(scenario.scenario_id)}</small></td>
+      <td>${escapeHtml(scenario.base_scenario_id || "BASELINE")}</td>
+      <td class="amount">${Array.isArray(scenario.assumptions) ? scenario.assumptions.length : 0}</td>
+      <td>${escapeHtml(scenario.description || "-")}</td>
+      <td>${escapeHtml(scenario.updated_at || scenario.created_at || "-")}</td>
+      <td class="scenario-row-actions">
+        <button type="button" data-edit-scenario="${escapeHtml(scenario.scenario_id)}">编辑</button>
+        <button type="button" data-delete-scenario="${escapeHtml(scenario.scenario_id)}">删除</button>
+      </td>
+    </tr>
+  `).join("") || `<tr><td colspan="6">暂无已保存的测算场景。</td></tr>`;
+  tbody.querySelectorAll("[data-edit-scenario]").forEach((button) => {
+    button.addEventListener("click", () => editScenario(button.dataset.editScenario));
+  });
+  tbody.querySelectorAll("[data-delete-scenario]").forEach((button) => {
+    button.addEventListener("click", () => deleteScenario(button.dataset.deleteScenario));
+  });
+};
+
+const editScenario = async (scenarioId) => {
+  const detail = await api(`/api/scenarios/${encodeURIComponent(scenarioId)}`);
+  state.scenarioEditingId = scenarioId;
+  state.scenarioDraftAssumptions = (detail.assumptions || []).map((assumption) => ({
+    ...assumption,
+    draft_id: `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  }));
+  el("whatIfEditorTitle").textContent = `编辑测算场景 · ${detail.scenario.scenario_name || scenarioId}`;
+  el("scenarioName").value = detail.scenario.scenario_name || "";
+  el("scenarioDescription").value = detail.scenario.description || "";
+  el("scenarioBase").value = detail.scenario.base_scenario_id || "BASELINE";
+  el("scenarioBase").disabled = true;
+  el("whatIfResult").innerHTML = "";
+  renderScenarioAssumptions();
+  showWhatIfEditor();
+  await refreshScenarioAssetComposer();
+};
+
+const deleteScenario = async (scenarioId) => {
+  const scenario = state.scenarios.find((item) => item.scenario_id === scenarioId);
+  if (!window.confirm(`确定删除“${scenario?.scenario_name || scenarioId}”及其计算结果吗？此操作不可恢复。`)) return;
+  await api(`/api/scenarios/${encodeURIComponent(scenarioId)}`, { method: "DELETE" });
+  if (state.scenarioId === scenarioId) state.scenarioId = "BASELINE";
+  await loadScenarios();
+  await loadDashboard();
+  await loadWhatIfScenarioList();
+};
+
+const scenarioSelectedCard = () => state.assetCards.find((card) => card.assetRef === el("scenarioAsset")?.value) || null;
+
+const scenarioTemplatesFor = (asset) => {
+  if (!asset || !state.ruleCatalog) return [];
+  return (state.ruleCatalog.methods || []).find((method) => method.method === asset.depreciationMethod)?.templates || [];
+};
+
+const scenarioTemplate = (templateId = el("ruleTemplate")?.value) => (
+  (state.ruleCatalog?.methods || []).flatMap((method) => method.templates || []).find((item) => item.id === templateId)
+);
+
+const scenarioPeriods = () => state.snapshotStatus?.forecast_periods || (state.scenarioDefaultPeriod ? [state.scenarioDefaultPeriod] : []);
+
+const scenarioPeriodOptions = (selected = state.scenarioDefaultPeriod) => scenarioPeriods().map((period) => (
+  `<option value="${escapeHtml(period)}" ${period === selected ? "selected" : ""}>${escapeHtml(period)}</option>`
+)).join("");
+
+const scenarioField = (id, label, { type = "number", value = "", hint = "", wide = false, min = "", step = "" } = {}) => `
+  <label class="${wide ? "wide-field" : ""}">${escapeHtml(label)}
+    <input id="${id}" type="${type}" value="${escapeHtml(value)}" ${min !== "" ? `min="${min}"` : ""} ${step ? `step="${step}"` : ""}>
+    ${hint ? `<span class="scenario-field-hint">${escapeHtml(hint)}</span>` : ""}
+  </label>`;
+
+const scenarioSelectField = (id, label, options, hint = "") => `
+  <label>${escapeHtml(label)}
+    <select id="${id}">${options}</select>
+    ${hint ? `<span class="scenario-field-hint">${escapeHtml(hint)}</span>` : ""}
+  </label>`;
+
+const renderScenarioAssetBaseline = () => {
+  const container = el("scenarioAssetBaseline");
+  const detail = state.scenarioAssetDetail;
+  const asset = detail?.asset || scenarioSelectedCard();
+  if (!asset) {
+    container.classList.remove("active");
+    container.innerHTML = "";
+    return;
   }
+  const policy = detail?.policy_narrative?.applicable_policy || {};
+  const source = detail?.source_context || {};
+  const lines = detail?.forecast_lines || [];
+  const periods = lines.map((line) => `${line.period} ${money(line.monthly_depreciation)}`).join(" · ") || "当前场景尚无月度记录";
+  const method = asset.depreciationMethodLabel || asset.depreciation_method_label_cn || "未匹配";
+  const code = asset.depreciationCodeLabel || asset.depreciation_code_label_cn || asset.depreciation_code || "未登记";
+  const usefulLife = source.useful_life_months || policy.useful_life_months || "-";
+  const startRule = source.start_rule === "CURRENT_MONTH" ? "当月开始计提" : source.start_rule === "NEXT_MONTH" ? "次月开始计提" : (policy.start_rule_label_cn || "-");
+  container.classList.add("active");
+  container.innerHTML = `
+    <div class="scenario-baseline-head"><strong>当前资产折旧信息（只读）</strong><span>${escapeHtml(asset.asset_ref || asset.assetRef || "")}</span></div>
+    <div class="scenario-baseline-grid">
+      <span>资产名称<b>${escapeHtml(asset.name || "-")}</b></span>
+      <span>折旧方法<b>${escapeHtml(method)}</b></span>
+      <span>折旧码<b>${escapeHtml(code)}</b></span>
+      <span>原值<b>${money(asset.baseAmount ?? asset.base_amount ?? asset.original_or_planned_amount)}</b></span>
+      <span>累计折旧<b>${money(lines[0]?.opening_accumulated_depreciation)}</b></span>
+      <span>使用年限 / 残值率<b>${escapeHtml(`${usefulLife} 个月 / ${policy.residual_rate_label_cn || source.residual_rate || "-"}`)}</b></span>
+      <span>开始计提<b>${escapeHtml(startRule)}</b></span>
+      <span>资产类别<b>${escapeHtml(asset.asset_category_label_cn || asset.category || "-")}</b></span>
+    </div>
+    <p class="scenario-baseline-note">月度折旧：${escapeHtml(periods)}。这些是当前场景的基准信息，仅用于核对，不可在此修改。</p>`;
+};
+
+const renderScenarioDynamicFields = () => {
+  const container = el("scenarioDynamicFields");
+  const asset = scenarioSelectedCard();
+  const template = scenarioTemplate();
+  const detail = state.scenarioAssetDetail;
+  if (!asset || !template) {
+    container.innerHTML = asset ? `<p class="empty-note">该资产未匹配可用的规则场景模板。</p>` : `<p class="empty-note">请先选择一项现有资产。</p>`;
+    return;
+  }
+  const driver = detail?.driver_context || {};
+  const baseline = driver.by_period?.[state.scenarioDefaultPeriod] || {};
+  const periodSelect = scenarioSelectField("scenarioPeriod", "生效月份", scenarioPeriodOptions(), "只可选择当前预测范围内的月份。");
+  if (template.id === "straight_impairment") {
+    container.innerHTML = [
+      scenarioField("scenarioAmount", "减值金额", { min: "0", step: "0.01", hint: "输入本次假设新增的减值金额。" }),
+      periodSelect,
+    ].join("");
+  } else if (template.id === "straight_accelerated") {
+    container.innerHTML = `<div class="scenario-readonly-target full-field"><b>无需额外填写</b><span class="scenario-field-hint">系统将把该资产的使用年限按基准年限的 60% 重算；原使用年限可在上方只读信息中核对。</span></div>`;
+  } else if (template.id === "straight_start_rule") {
+    container.innerHTML = scenarioSelectField(
+      "scenarioStartRule", "开始计提规则",
+      `<option value="NEXT_MONTH">次月开始计提</option><option value="CURRENT_MONTH">当月开始计提</option>`,
+      "仅调整该资产的开始计提规则。"
+    );
+  } else if (template.id === "straight_new_asset") {
+    container.innerHTML = [
+      scenarioField("scenarioAssetName", "新增资产名称", { type: "text", value: `${asset.name || "资产"}（新增）`, hint: "将沿用所选资产的组织、类别和折旧码。" }),
+      scenarioField("scenarioAmount", "新增资产原值", { min: "0", step: "0.01" }),
+      scenarioField("scenarioInServiceDate", "资本化日期", { type: "date", value: state.scenarioDefaultPeriod ? `${state.scenarioDefaultPeriod}-01` : "" }),
+    ].join("");
+  } else if (template.id === "production_driver") {
+    if (!driver.target_id) {
+      container.innerHTML = `<p class="empty-note">该资产未登记所属区块，无法建立产量法假设。</p>`;
+      return;
+    }
+    container.innerHTML = [
+      `<div class="scenario-readonly-target"><b>${escapeHtml(driver.target_label_cn || `区块 ${driver.target_id}`)}</b><span class="scenario-field-hint">目标区块由资产台账自动带入，不可修改。</span></div>`,
+      periodSelect,
+      scenarioField("scenarioProduction", "区块产量", { min: "0", step: "0.0001", hint: `基准 ${baseline.production ?? "-"}；留空表示保持基准。` }),
+      scenarioField("scenarioReserves", "剩余储量", { min: "0", step: "0.0001", hint: `基准 ${baseline.reserves ?? "-"}；留空表示保持基准。` }),
+    ].join("");
+  } else if (template.id === "workload_driver") {
+    if (!driver.target_id) {
+      container.innerHTML = `<p class="empty-note">该资产未登记工作量法分摊对象，无法建立工作量法假设。</p>`;
+      return;
+    }
+    container.innerHTML = [
+      `<div class="scenario-readonly-target"><b>${escapeHtml(driver.target_label_cn || driver.target_id)}</b><span class="scenario-field-hint">分摊对象由资产台账自动带入，不可修改。</span></div>`,
+      periodSelect,
+      scenarioField("scenarioWorkload", "工作量", { min: "0", step: "0.0001", hint: `基准 ${baseline.workload ?? "-"}；留空表示保持基准。` }),
+      scenarioField("scenarioUnitFee", "单位费用", { min: "0", step: "0.0001", hint: `基准 ${baseline.unit_fee ?? "-"}；留空表示保持基准。` }),
+      scenarioField("scenarioTotalAmortization", "当月总摊销额", { min: "0", step: "0.01", hint: `基准 ${baseline.total_amortization || "-"}；填写后优先采用该金额。`, wide: true }),
+    ].join("");
+  } else {
+    container.innerHTML = `<p class="empty-note">当前规则模板尚未配置输入项。</p>`;
+  }
+};
+
+const refreshScenarioTemplateOptions = () => {
+  const select = el("ruleTemplate");
+  const asset = scenarioSelectedCard();
+  if (!select) return;
+  const current = select.value;
+  const templates = scenarioTemplatesFor(asset);
+  select.innerHTML = "";
+  if (!asset) {
+    select.disabled = true;
+    select.innerHTML = `<option value="">请先选择资产</option>`;
+    return;
+  }
+  if (!templates.length) {
+    select.disabled = true;
+    select.innerHTML = `<option value="">该折旧方法暂不支持场景假设</option>`;
+    return;
+  }
+  select.disabled = false;
+  for (const template of templates) {
+    const option = document.createElement("option");
+    option.value = template.id;
+    option.textContent = template.label_cn;
+    option.title = template.description_cn;
+    select.appendChild(option);
+  }
+  select.value = templates.some((item) => item.id === current) ? current : templates[0].id;
+};
+
+const refreshScenarioAssetComposer = async () => {
+  refreshScenarioTemplateOptions();
+  const asset = scenarioSelectedCard();
+  if (!asset) {
+    state.scenarioAssetDetail = null;
+    renderScenarioAssetBaseline();
+    renderScenarioDynamicFields();
+    return;
+  }
+  const baseline = el("scenarioAssetBaseline");
+  baseline.classList.add("active");
+  baseline.innerHTML = `<p class="scenario-baseline-note">正在读取 ${escapeHtml(asset.assetRef)} 的当前折旧信息和规则参数...</p>`;
+  try {
+    state.scenarioAssetDetail = await api(`/api/assets/detail?scenario_id=${encodeURIComponent(el("scenarioBase")?.value || state.scenarioId)}&asset_ref=${encodeURIComponent(asset.assetRef)}`);
+  } catch (error) {
+    state.scenarioAssetDetail = null;
+    baseline.innerHTML = `<p class="scenario-baseline-note">未能读取资产折旧信息：${escapeHtml(error.message)}</p>`;
+  }
+  renderScenarioAssetBaseline();
+  renderScenarioDynamicFields();
 };
 
 const buildScenarioAssumption = () => {
   const templateId = el("ruleTemplate").value;
-  const assetId = el("scenarioAsset").value;
+  const asset = scenarioSelectedCard();
+  const detail = state.scenarioAssetDetail || {};
+  if (!asset || !templateId) throw new Error("请先选择目标资产和假设类型。");
+  const value = (id) => el(id)?.value?.trim?.() ?? el(id)?.value ?? "";
+  const period = value("scenarioPeriod");
   const assumption = {
     draft_id: `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     template_id: templateId,
-    target_id: assetId,
-    asset_id: assetId,
-    reference_asset_id: assetId,
-    block_id: el("scenarioBlock").value.trim(),
-    company: el("scenarioCompany").value.trim(),
-    period: el("scenarioPeriod").value.trim(),
-    effective_date: `${el("scenarioPeriod").value.trim()}-01`,
-    amount: el("scenarioAmount").value || "0",
-    production: el("scenarioProduction").value || "0",
-    reserves: el("scenarioReserves").value || "0",
-    workload: el("scenarioWorkload").value || "0",
-    unit_fee: el("scenarioUnitFee").value || "0",
-    start_rule: el("scenarioStartRule").value,
-    asset_name: el("scenarioAssetName").value.trim(),
-    asset_category: el("scenarioAssetCategory").value.trim(),
-    depreciation_code: el("scenarioDepreciationCode").value.trim(),
-    in_service_date: el("scenarioInServiceDate").value,
+    target_id: asset.assetRef,
+    asset_id: asset.assetRef,
+    reference_asset_id: asset.assetRef,
   };
-  if (templateId === "production_driver" && !assumption.block_id) {
-    throw new Error("产量法场景需要填写所属区块。");
-  }
-  if (["straight_impairment", "straight_accelerated", "straight_start_rule"].includes(templateId) && !assetId) {
-    throw new Error("该规则场景需要选择目标资产。");
-  }
-  if (templateId === "straight_new_asset" && (!assumption.amount || !assumption.in_service_date)) {
-    throw new Error("新增资产场景需要填写金额和资本化日期。");
+  if (templateId === "straight_impairment") {
+    if (value("scenarioAmount") === "" || !period) throw new Error("请填写减值金额和生效月份。");
+    Object.assign(assumption, { amount: value("scenarioAmount"), period, effective_date: `${period}-01` });
+  } else if (templateId === "straight_start_rule") {
+    Object.assign(assumption, { start_rule: value("scenarioStartRule") || "NEXT_MONTH" });
+  } else if (templateId === "straight_new_asset") {
+    if (value("scenarioAmount") === "" || !value("scenarioInServiceDate")) throw new Error("请填写新增资产原值和资本化日期。");
+    Object.assign(assumption, {
+      asset_id: `NEW-${Date.now().toString().slice(-8)}`,
+      asset_name: value("scenarioAssetName") || `${asset.name}（新增）`,
+      asset_category: asset.category,
+      depreciation_code: asset.depreciationCode,
+      amount: value("scenarioAmount"),
+      in_service_date: value("scenarioInServiceDate"),
+    });
+  } else if (templateId === "production_driver") {
+    const driver = detail.driver_context || {};
+    if (!driver.target_id || !period) throw new Error("该产量法资产缺少区块或生效月份，无法建立假设。");
+    if (value("scenarioProduction") === "" && value("scenarioReserves") === "") throw new Error("请至少填写区块产量或剩余储量中的一项。");
+    Object.assign(assumption, {
+      block_id: driver.target_id, company: asset.company, period,
+      ...(value("scenarioProduction") !== "" ? { production: value("scenarioProduction") } : {}),
+      ...(value("scenarioReserves") !== "" ? { reserves: value("scenarioReserves") } : {}),
+    });
+  } else if (templateId === "workload_driver") {
+    const driver = detail.driver_context || {};
+    if (!driver.target_id || !period) throw new Error("该工作量法资产缺少分摊对象或生效月份，无法建立假设。");
+    if (["scenarioWorkload", "scenarioUnitFee", "scenarioTotalAmortization"].every((id) => value(id) === "")) {
+      throw new Error("请至少填写工作量、单位费用或当月总摊销额中的一项。");
+    }
+    Object.assign(assumption, {
+      company: driver.target_id, period,
+      ...(value("scenarioWorkload") !== "" ? { workload: value("scenarioWorkload") } : {}),
+      ...(value("scenarioUnitFee") !== "" ? { unit_fee: value("scenarioUnitFee") } : {}),
+      ...(value("scenarioTotalAmortization") !== "" ? { total_amortization: value("scenarioTotalAmortization") } : {}),
+    });
   }
   return assumption;
 };
@@ -1103,22 +1397,39 @@ const scenarioAssumptionLabel = (assumption) => {
   const template = (state.ruleCatalog?.methods || [])
     .flatMap((method) => method.templates || [])
     .find((item) => item.id === assumption.template_id);
-  const target = assumption.block_id || assumption.asset_id || assumption.company || "待指定对象";
+  const target = assumption.template_id === "straight_new_asset"
+    ? `${assumption.asset_name || "新增资产"}（参照 ${assumption.reference_asset_id || "-"}）`
+    : assumption.block_id || assumption.asset_id || assumption.company || "待指定对象";
   return `${template?.label_cn || assumption.template_id} · ${target}`;
+};
+
+const scenarioAssumptionSummary = (assumption) => {
+  const pairs = [];
+  if (assumption.period) pairs.push(`生效月份 ${assumption.period}`);
+  if (assumption.amount !== undefined) pairs.push(`${assumption.template_id === "straight_impairment" ? "减值金额" : "金额"} ${money(assumption.amount)}`);
+  if (assumption.production !== undefined) pairs.push(`产量 ${assumption.production}`);
+  if (assumption.reserves !== undefined) pairs.push(`剩余储量 ${assumption.reserves}`);
+  if (assumption.workload !== undefined) pairs.push(`工作量 ${assumption.workload}`);
+  if (assumption.unit_fee !== undefined) pairs.push(`单位费用 ${assumption.unit_fee}`);
+  if (assumption.total_amortization !== undefined) pairs.push(`总摊销额 ${money(assumption.total_amortization)}`);
+  if (assumption.start_rule) pairs.push(assumption.start_rule === "CURRENT_MONTH" ? "当月开始计提" : "次月开始计提");
+  return pairs.join("；") || "按规则默认参数执行";
 };
 
 const renderScenarioAssumptions = () => {
   const container = el("scenarioAssumptionList");
   if (!state.scenarioDraftAssumptions.length) {
     container.innerHTML = `<p class="empty-note">尚未加入假设。填写上方规则输入后点击“加入场景假设”。</p>`;
+    el("scenarioDraftHint").textContent = "请先添加至少一条资产假设。";
     return;
   }
   container.innerHTML = state.scenarioDraftAssumptions.map((assumption, index) => `
     <article class="scenario-assumption-item">
-      <div><strong>${escapeHtml(`${index + 1}. ${scenarioAssumptionLabel(assumption)}`)}</strong><span>${escapeHtml(assumption.period || assumption.effective_date || "预测期内生效")}</span></div>
+      <div class="assumption-summary"><strong>${escapeHtml(`${index + 1}. ${scenarioAssumptionLabel(assumption)}`)}</strong><span>${escapeHtml(scenarioAssumptionSummary(assumption))}</span></div>
       <button type="button" data-draft-id="${escapeHtml(assumption.draft_id)}" title="移除该假设">移除</button>
     </article>
   `).join("");
+  el("scenarioDraftHint").textContent = `已添加 ${state.scenarioDraftAssumptions.length} 条资产假设，保存后统一重算。`;
   container.querySelectorAll("[data-draft-id]").forEach((button) => {
     button.addEventListener("click", () => {
       state.scenarioDraftAssumptions = state.scenarioDraftAssumptions.filter((item) => item.draft_id !== button.dataset.draftId);
@@ -1132,6 +1443,7 @@ const addScenarioAssumption = () => {
     state.scenarioDraftAssumptions.push(buildScenarioAssumption());
     renderScenarioAssumptions();
     el("whatIfResult").textContent = `已加入 ${state.scenarioDraftAssumptions.length} 条场景假设，保存后会统一重算。`;
+    renderScenarioDynamicFields();
   } catch (error) {
     el("whatIfResult").textContent = error.message;
   }
@@ -1156,17 +1468,28 @@ const submitScenario = async (event) => {
 };
 
 const runWhatIf = async (payload) => {
-  el("whatIfResult").textContent = "正在生成新场景并重算...";
-  const result = await api("/api/scenarios", {
+  el("whatIfResult").textContent = state.scenarioEditingId ? "正在更新场景并重算..." : "正在确认场景并计算...";
+  const url = state.scenarioEditingId
+    ? `/api/scenarios/${encodeURIComponent(state.scenarioEditingId)}/assumptions`
+    : "/api/scenarios";
+  const body = state.scenarioEditingId
+    ? {
+      assumptions: payload.assumptions,
+      replace_existing: true,
+      scenario_name: payload.scenario_name,
+      description: payload.description,
+    }
+    : payload;
+  const result = await api(url, {
     method: "POST",
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   state.scenarioId = result.scenario.scenario_id;
   state.scenarioDraftAssumptions = [];
-  renderScenarioAssumptions();
   await loadScenarios();
   await loadDashboard();
-  renderWhatIfResult(result);
+  await loadWhatIfScenarioList();
+  showWhatIfList();
 };
 
 const renderWhatIfResult = (result) => {
@@ -1216,10 +1539,12 @@ const loadScenarioCompare = async () => {
   }
   el("compareStatus").textContent = "正在生成对比宽表...";
   try {
+    normalizeCompareDimensions();
     const payload = {
       scenario_ids: scenarioIds,
       scenarios: scenarioIds,
-      row_type: el("compareRowType").value,
+      row_type: "overview",
+      dimensions: selectedCompareDimensions(),
       period_from: el("comparePeriodFrom").value,
       period_to: el("comparePeriodTo").value,
       diff_mode: el("compareDiffMode").value,
@@ -1237,83 +1562,74 @@ const loadScenarioCompare = async () => {
 const renderScenarioCompare = (data, payload) => {
   const rows = data.rows || [];
   const periods = data.periods || data.months || [];
-  const fixedColumns = data.fixed_columns || data.fixedColumns || inferCompareFixedColumns(rows);
-  el("compareStatus").textContent = `${payload.scenario_ids.join(" / ")} · ${labels[payload.row_type] || payload.row_type} · ${rows.length} 行 · ${periods.length || (data.columns || []).length} 列 · ${labels[payload.diff_mode] || payload.diff_mode}`;
-  if (data.columns && !periods.length) {
-    renderGenericCompareTable(data.columns, rows);
-    return;
-  }
+  const dimensions = data.dimensions || payload.dimensions || [];
+  const dimensionNames = dimensions.map((dimension) => (
+    data.dimension_catalog?.dimensions?.find((item) => item.id === dimension)?.label_cn || labels[dimension] || dimension
+  ));
+  const visibleNodes = [];
+  const appendNodes = (nodes) => {
+    for (const node of nodes || []) {
+      visibleNodes.push(node);
+      if ((node.children || []).length && state.compareExpanded.has(node.id)) appendNodes(node.children);
+    }
+  };
+  appendNodes(data.tree || []);
+  const scope = dimensionNames.length ? `下钻维度：${dimensionNames.join(" > ")}` : "总览：全部资产";
+  el("compareStatus").textContent = `${payload.scenario_ids.join(" / ")} · ${scope} · ${visibleNodes.length} 行 · ${periods.length} 个月 · ${labels[payload.diff_mode] || payload.diff_mode}`;
   el("compareTableHead").innerHTML = `
     <tr>
-      ${fixedColumns.map((column, index) => `<th class="${index < 2 ? `sticky-col sticky-${index + 1}` : ""}">${escapeHtml(labels[column] || column)}</th>`).join("")}
+      <th class="sticky-col sticky-1">层级</th>
+      <th class="sticky-col sticky-2">分析对象</th>
       ${periods.map((period) => `<th class="month-head">${escapeHtml(period)}</th>`).join("")}
     </tr>
   `;
-  el("compareTableBody").innerHTML = rows.map((row) => `
+  el("compareTableBody").innerHTML = visibleNodes.map((node) => `
     <tr>
-      ${fixedColumns.map((column, index) => compareFixedCell(row, column, index)).join("")}
-      ${periods.map((period) => `<td class="amount compare-period-cell">${formatComparePeriodValue(getComparePeriodValue(row, period), payload)}</td>`).join("")}
+      <td class="sticky-col sticky-1">${escapeHtml(node.dimension_label_cn || labels[node.dimension] || node.dimension || "总览")}</td>
+      <td class="wide-node sticky-col sticky-2" style="--node-depth:${Number(node.depth || 0)}">
+        ${(node.children || []).length ? `<button class="tree-toggle" type="button" data-compare-tree-id="${escapeHtml(node.id)}" aria-label="展开或收起">${state.compareExpanded.has(node.id) ? "−" : "+"}</button>` : "<span class=\"tree-leaf\"></span>"}
+        ${node.dimension === "asset" ? `<button class="link-button" type="button" data-policy-ref="${escapeHtml(node.value)}">${escapeHtml(node.label_cn || node.value)}</button>` : escapeHtml(node.label_cn || node.value || "全部资产")}
+      </td>
+      ${periods.map((period) => `<td class="amount compare-period-cell">${formatComparePeriodValue(node.months?.[period], payload)}</td>`).join("")}
     </tr>
-  `).join("") || `<tr><td colspan="${fixedColumns.length + periods.length}">没有符合条件的数据</td></tr>`;
+  `).join("") || `<tr><td colspan="${periods.length + 2}">没有符合条件的数据</td></tr>`;
+  el("compareTableBody").querySelectorAll("[data-compare-tree-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.compareTreeId;
+      if (state.compareExpanded.has(id)) state.compareExpanded.delete(id);
+      else state.compareExpanded.add(id);
+      renderScenarioCompare(data, payload);
+    });
+  });
   el("compareTableBody").querySelectorAll("[data-policy-ref]").forEach((button) => {
     button.addEventListener("click", () => drillToPolicy(button.dataset.policyRef));
   });
-};
-
-const renderGenericCompareTable = (columns, rows) => {
-  el("compareTableHead").innerHTML = `<tr>${columns.map((column) => `<th>${escapeHtml(labels[column] || column)}</th>`).join("")}</tr>`;
-  el("compareTableBody").innerHTML = rows.map((row) => `
-    <tr>${columns.map((column) => `<td>${escapeHtml(row[column] ?? "")}</td>`).join("")}</tr>
-  `).join("") || `<tr><td colspan="${columns.length}">没有符合条件的数据</td></tr>`;
-};
-
-const inferCompareFixedColumns = (rows) => {
-  const row = rows[0] || {};
-  const blocked = new Set(["months", "values", "periods", "scenario_values", "annual_total"]);
-  const columns = Object.keys(row).filter((key) => !blocked.has(key) && typeof row[key] !== "object");
-  return columns.length ? columns.slice(0, 4) : ["asset_ref"];
-};
-
-const compareFixedCell = (row, column, index) => {
-  const sticky = index < 2 ? ` sticky-col sticky-${index + 1}` : "";
-  if (column === "asset_ref") {
-    const ref = row.asset_ref || row.asset_id || row.id || "";
-    return `<td class="key-cell${sticky}"><button class="link-button" type="button" data-policy-ref="${escapeHtml(ref)}">${escapeHtml(ref)}</button></td>`;
-  }
-  if (column === "asset_source_type") {
-    return `<td class="${sticky}">${escapeHtml(labels[row[column]] || row[column] || "")}</td>`;
-  }
-  if (column === "asset_category") {
-    return `<td class="${sticky}">${escapeHtml(categoryLabels[row[column]] || row[column] || "")}</td>`;
-  }
-  return `<td class="${sticky}">${escapeHtml(row[column] ?? "")}</td>`;
-};
-
-const getComparePeriodValue = (row, period) => {
-  if (row.months && row.months[period] !== undefined) return row.months[period];
-  if (row.values && row.values[period] !== undefined) return row.values[period];
-  if (row.periods && row.periods[period] !== undefined) return row.periods[period];
-  if (row.scenario_values && row.scenario_values[period] !== undefined) return row.scenario_values[period];
-  return "";
 };
 
 const formatComparePeriodValue = (value, payload) => {
   if (value === "" || value === null || value === undefined) return "-";
   if (typeof value === "number" || !Number.isNaN(Number(value))) return money(value);
   if (typeof value !== "object") return escapeHtml(value);
-  const scenarioLines = payload.scenario_ids.map((scenarioId) => {
+  const scenarioLabel = (scenarioId) => state.scenarios.find((item) => item.scenario_id === scenarioId)?.scenario_name || scenarioId;
+  const baselineId = Object.keys(value).find((key) => key === "BASELINE") || payload.scenario_ids[0];
+  const orderedScenarioIds = [...new Set([baselineId, ...payload.scenario_ids])];
+  const scenarioLines = orderedScenarioIds.map((scenarioId) => {
     const scenarioValue = value[scenarioId] ?? value.scenarios?.[scenarioId];
-    return scenarioValue === undefined ? "" : `<span>${escapeHtml(scenarioId)}: ${money(scenarioValue)}</span>`;
+    if (scenarioValue === undefined) return "";
+    const prefix = scenarioId === baselineId ? "基准" : scenarioLabel(scenarioId);
+    return `<span class="compare-value-line">${escapeHtml(prefix)}: ${money(scenarioValue)}</span>`;
   }).filter(Boolean);
   const diffAmount = firstValue(value, ["diff_amount", "difference", "amount_diff"]);
   const diffPercent = firstValue(value, ["diff_percent", "percentage_diff", "percent_diff"]);
   const diffLines = [];
+  const differenceNumber = Number(diffAmount || 0);
+  const diffClass = differenceNumber > 0 ? "compare-diff-positive" : differenceNumber < 0 ? "compare-diff-negative" : "compare-diff-neutral";
   if ((payload.diff_mode === "amount" || payload.diff_mode === "both") && diffAmount !== "") {
-    diffLines.push(`<strong>${money(diffAmount)}</strong>`);
+    diffLines.push(`<strong class="${diffClass}">差异: ${differenceNumber > 0 ? "+" : ""}${money(diffAmount)}</strong>`);
   }
   if ((payload.diff_mode === "percent" || payload.diff_mode === "both") && diffPercent !== "") {
     const number = Number(diffPercent) <= 1 ? Number(diffPercent) * 100 : Number(diffPercent);
-    diffLines.push(`<em>${percent(number)}</em>`);
+    diffLines.push(`<em class="${diffClass}">${number > 0 ? "+" : ""}${percent(number)}</em>`);
   }
   return [...scenarioLines, ...diffLines].join("") || escapeHtml(JSON.stringify(value));
 };
@@ -1597,14 +1913,10 @@ const prefillWhatIfFromGraph = async (actionType, node) => {
   if (properties.asset_ref || node.technical_ref) {
     el("scenarioAsset").value = properties.asset_ref || node.technical_ref;
   }
-  if (node.object_type === "Block") {
-    el("ruleTemplate").value = "production_driver";
-    el("scenarioBlock").value = properties.block_id || node.technical_ref || "";
-  }
-  if (node.object_type === "MonthlyDriver") {
-    el("ruleTemplate").value = properties.driver_type === "WORKLOAD" ? "workload_driver" : "production_driver";
-    el("scenarioPeriod").value = properties.period || el("scenarioPeriod").value;
-    el("scenarioBlock").value = properties.driver_type === "PRODUCTION" ? properties.target_id || "" : el("scenarioBlock").value;
+  await refreshScenarioAssetComposer();
+  if (node.object_type === "MonthlyDriver" && properties.period) {
+    const period = el("scenarioPeriod");
+    if (period) period.value = properties.period;
   }
 };
 
@@ -1783,6 +2095,8 @@ const showView = async (view) => {
   if (view === "whatif") {
     await loadRuleCatalog();
     renderScenarioAssumptions();
+    await loadWhatIfScenarioList();
+    showWhatIfList();
   }
   if (view === "assets") await loadAssetWorkbench();
   if (view === "reverse") state.reverseCatalog = await softApi("/api/reverse-planning/catalog", null);
@@ -1826,14 +2140,33 @@ el("reverseQuestionInput").addEventListener("keydown", (event) => {
   if (event.key === "Enter") askReversePlanning();
 });
 el("scenarioForm").addEventListener("submit", submitScenario);
+el("newScenarioBtn").addEventListener("click", async () => {
+  resetScenarioEditor();
+  showWhatIfEditor();
+  await refreshScenarioAssetComposer();
+});
+el("backToScenarioListBtn").addEventListener("click", async () => {
+  resetScenarioEditor();
+  await loadWhatIfScenarioList();
+  showWhatIfList();
+});
 el("addScenarioAssumptionBtn").addEventListener("click", addScenarioAssumption);
+el("scenarioAsset").addEventListener("change", refreshScenarioAssetComposer);
+el("ruleTemplate").addEventListener("change", renderScenarioDynamicFields);
+el("scenarioBase").addEventListener("change", refreshScenarioAssetComposer);
 el("clearScenarioAssumptionsBtn").addEventListener("click", () => {
   state.scenarioDraftAssumptions = [];
   renderScenarioAssumptions();
 });
 el("compareBtn").addEventListener("click", loadScenarioCompare);
-el("compareRowType").addEventListener("change", loadScenarioCompare);
 el("compareDiffMode").addEventListener("change", loadScenarioCompare);
+["compareDimension1", "compareDimension2"].forEach((id) => {
+  el(id).addEventListener("change", () => {
+    normalizeCompareDimensions();
+    state.compareExpanded = new Set();
+    loadScenarioCompare();
+  });
+});
 el("openAssetsBtn").addEventListener("click", () => showView("assets"));
 el("assetSearchBtn").addEventListener("click", loadAssetWorkbench);
 el("assetSearchInput").addEventListener("keydown", (event) => {

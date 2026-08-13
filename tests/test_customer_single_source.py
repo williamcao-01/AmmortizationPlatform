@@ -61,6 +61,95 @@ class CustomerSingleSourceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "只能包含当前两份受控 Excel"):
                 CustomerExcelRepository(root)
 
+    def test_asset_detail_exposes_read_only_rule_context_for_what_if(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            try:
+                production_asset = next(
+                    item for item in state.assets_cards({"scenario_id": ["BASELINE"]})
+                    if item["depreciation_method"] == "PRODUCTION"
+                )
+                detail = state.asset_detail({
+                    "scenario_id": ["BASELINE"],
+                    "asset_ref": [production_asset["asset_ref"]],
+                })
+                self.assertEqual(detail["asset"]["asset_ref"], production_asset["asset_ref"])
+                self.assertEqual(detail["driver_context"]["driver_type"], "PRODUCTION")
+                self.assertTrue(detail["driver_context"]["target_id"])
+                self.assertIn("2026-07", detail["driver_context"]["by_period"])
+                self.assertIn("useful_life_months", detail["source_context"])
+            finally:
+                state.close()
+
+    def test_scenario_compare_supports_overview_and_two_level_drilldown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            try:
+                asset = next(item for item in state.repository.load_fixed_assets() if item.depreciation_code == "Z112")
+                state.create_customer_scenario({
+                    "base_scenario_id": "BASELINE",
+                    "scenario_name": "场景对比下钻测试",
+                    "assumptions": [{
+                        "template_id": "straight_impairment",
+                        "asset_id": asset.asset_id,
+                        "amount": "100",
+                        "effective_date": "2026-07-01",
+                    }],
+                })
+                overview = state.wide_table_compare({
+                    "scenario_ids": ["BASELINE", "SCN-001"],
+                    "period_from": "2026-06",
+                    "period_to": "2026-08",
+                })
+                self.assertEqual(overview["dimensions"], [])
+                self.assertEqual(overview["tree"][0]["dimension"], "scope_label")
+                self.assertIn("SCN-001", overview["tree"][0]["months"]["2026-07"])
+
+                drilldown = state.wide_table_compare({
+                    "scenario_ids": ["BASELINE", "SCN-001"],
+                    "dimensions": ["department", "depreciation_code"],
+                    "period_from": "2026-06",
+                    "period_to": "2026-08",
+                })
+                self.assertEqual(drilldown["dimensions"], ["department", "depreciation_code"])
+                self.assertEqual(drilldown["tree"][0]["dimension"], "department")
+                self.assertTrue(drilldown["tree"][0]["children"])
+                self.assertEqual(drilldown["tree"][0]["children"][0]["dimension"], "depreciation_code")
+            finally:
+                state.close()
+
+    def test_saved_what_if_scenario_survives_state_restart_and_can_be_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = self.make_state(root)
+            asset = next(item for item in first.repository.load_fixed_assets() if item.depreciation_code == "Z112")
+            try:
+                created = first.create_customer_scenario({
+                    "base_scenario_id": "BASELINE",
+                    "scenario_name": "持久化测试场景",
+                    "assumptions": [{
+                        "template_id": "straight_impairment",
+                        "asset_id": asset.asset_id,
+                        "amount": "100",
+                        "effective_date": "2026-07-01",
+                    }],
+                })
+                self.assertEqual(created["scenario"]["scenario_id"], "SCN-001")
+            finally:
+                first.close()
+
+            second = self.make_state(root)
+            try:
+                persisted = second.scenario_detail("SCN-001")
+                self.assertEqual(persisted["scenario"]["scenario_name"], "持久化测试场景")
+                self.assertEqual(len(persisted["assumptions"]), 1)
+                self.assertTrue(persisted["dashboard"]["kpis"]["forecast_line_count"])
+                second.delete_scenario("SCN-001")
+                self.assertIsNone(second.business_store.scenario("SCN-001"))
+                self.assertEqual([item["scenario_id"] for item in second.scenarios()], ["BASELINE"])
+            finally:
+                second.close()
+
 
 if __name__ == "__main__":
     unittest.main()

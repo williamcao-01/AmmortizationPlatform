@@ -189,45 +189,69 @@
       </section>
 
       <section id="whatif" class="view">
-        <section class="panel">
+        <section id="whatIfListView" class="panel">
           <div class="panel-head">
             <div>
-              <h2>What-if 测算</h2>
-              <span>选择规则场景，保存独立测算版本并重算当前数据覆盖期间</span>
+              <h2>测算场景</h2>
+              <span>已确认的场景、假设与计算结果会保存在业务库中，可随时重新编辑或删除。</span>
             </div>
+            <button id="newScenarioBtn" type="button">新建测算场景</button>
           </div>
-          <form id="scenarioForm" class="scenario-form">
-            <label>场景名称<input id="scenarioName" placeholder="输入场景名称"></label>
-            <label>场景说明<input id="scenarioDescription" placeholder="输入场景说明"></label>
-            <label>基准场景<select id="scenarioBase"></select></label>
-            <label>规则场景<select id="ruleTemplate"></select></label>
-            <label>目标资产<select id="scenarioAsset"></select></label>
-            <label>区块<input id="scenarioBlock" placeholder="从当前配置表选择或输入"></label>
-            <label>公司<input id="scenarioCompany" placeholder="由当前台账自动带入"></label>
-            <label>生效月份<input id="scenarioPeriod" placeholder="从当前预测范围选择"></label>
-            <label>金额 / 减值金额<input id="scenarioAmount" type="number" min="0" step="0.01"></label>
-            <label>产量<input id="scenarioProduction" type="number" min="0" step="0.0001"></label>
-            <label>剩余储量<input id="scenarioReserves" type="number" min="0" step="0.0001"></label>
-            <label>工作量<input id="scenarioWorkload" type="number" min="0" step="0.0001"></label>
-            <label>单位费用<input id="scenarioUnitFee" type="number" min="0" step="0.0001"></label>
-            <label>开始计提<select id="scenarioStartRule"><option value="NEXT_MONTH">次月开始计提</option><option value="CURRENT_MONTH">当月开始计提</option></select></label>
-            <label>新增资产名称<input id="scenarioAssetName" placeholder="输入新增资产名称"></label>
-            <label>新增资产类别<input id="scenarioAssetCategory"></label>
-            <label>新增资产折旧码<input id="scenarioDepreciationCode" placeholder="从当前折旧码目录选择"></label>
-            <label>资本化日期<input id="scenarioInServiceDate" type="date"></label>
-            <button id="addScenarioAssumptionBtn" type="button">加入场景假设</button>
-            <button type="submit">保存场景并重算</button>
-          </form>
-          <section class="scenario-assumption-panel" aria-labelledby="scenarioAssumptionsTitle">
-            <div class="panel-head compact-head">
-              <div>
-                <h3 id="scenarioAssumptionsTitle">本场景假设</h3>
-                <span>同一场景可叠加多条假设，统一重算后保存。</span>
-              </div>
-              <button id="clearScenarioAssumptionsBtn" type="button" title="清空当前草稿">清空</button>
+          <div id="whatIfScenarioStatus" class="table-status"></div>
+          <div class="table-wrap scenario-list-wrap">
+            <table class="scenario-list-table">
+              <thead><tr><th>场景名称</th><th>基准场景</th><th>假设数</th><th>场景说明</th><th>最后计算时间</th><th>操作</th></tr></thead>
+              <tbody id="whatIfScenarioList"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="whatIfEditorView" class="panel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2 id="whatIfEditorTitle">新建测算场景</h2>
+              <span>在同一场景中逐项添加资产假设，系统按各资产的折旧方法统一重算</span>
             </div>
-            <div id="scenarioAssumptionList" class="scenario-assumption-list"></div>
-          </section>
+            <button id="backToScenarioListBtn" type="button">返回场景清单</button>
+          </div>
+          <form id="scenarioForm">
+            <section class="scenario-meta-grid" aria-label="场景基本信息">
+              <label>场景名称<input id="scenarioName" placeholder="例如：8 月区块产量调整方案"></label>
+              <label>场景说明<input id="scenarioDescription" placeholder="说明本次测算的业务假设"></label>
+              <label>基准场景<select id="scenarioBase"></select></label>
+            </section>
+            <section class="scenario-composer" aria-labelledby="scenarioComposerTitle">
+              <div class="panel-head compact-head">
+                <div>
+                  <h3 id="scenarioComposerTitle">添加资产假设</h3>
+                  <span>选择资产后，系统会按其折旧方法显示可用的假设项。</span>
+                </div>
+              </div>
+              <div class="scenario-selection-grid">
+                <label>目标资产<select id="scenarioAsset"></select></label>
+                <label>假设类型<select id="ruleTemplate"></select></label>
+              </div>
+              <div id="scenarioAssetBaseline" class="scenario-asset-baseline" aria-live="polite"></div>
+              <div id="scenarioDynamicFields" class="scenario-dynamic-fields" aria-live="polite"></div>
+              <div class="scenario-composer-actions">
+                <button id="addScenarioAssumptionBtn" type="button">加入本场景</button>
+              </div>
+            </section>
+            <section class="scenario-assumption-panel" aria-labelledby="scenarioAssumptionsTitle">
+              <div class="panel-head compact-head">
+                <div>
+                  <h3 id="scenarioAssumptionsTitle">本场景假设</h3>
+                  <span>可叠加多个资产或业务驱动假设；保存后统一重算。</span>
+                </div>
+                <button id="clearScenarioAssumptionsBtn" type="button" title="清空当前草稿">清空</button>
+              </div>
+              <div id="scenarioAssumptionList" class="scenario-assumption-list"></div>
+            </section>
+            <div class="scenario-submit-row">
+              <span id="scenarioDraftHint">请先添加至少一条资产假设。</span>
+              <button type="submit">确认场景并计算</button>
+            </div>
+          </form>
           <div id="whatIfResult" class="result-box"></div>
         </section>
       </section>
@@ -256,24 +280,17 @@
           <div class="panel-head controls">
             <div>
               <h2>场景对比</h2>
-              <span>多场景、多期间横向比较宽表，差异只在当前容器内滚动</span>
+              <span>选择多个场景后，按月横向比较；可按一级、二级分析维度逐层展开</span>
             </div>
             <div class="control-row compare-controls">
               <label>场景
                 <select id="compareScenarios" multiple size="4"></select>
               </label>
-              <label>行类型
-                <select id="compareRowType">
-                  <option value="asset">资产</option>
-                  <option value="department">部门</option>
-                  <option value="category">类别</option>
-                </select>
-              </label>
               <label>起始期间
-                <input id="comparePeriodFrom" aria-label="场景对比起始期间">
+                <input id="comparePeriodFrom" type="month" aria-label="场景对比起始期间">
               </label>
               <label>结束期间
-                <input id="comparePeriodTo" aria-label="场景对比结束期间">
+                <input id="comparePeriodTo" type="month" aria-label="场景对比结束期间">
               </label>
               <label>差异模式
                 <select id="compareDiffMode">
@@ -281,6 +298,12 @@
                   <option value="percent">百分比差异</option>
                   <option value="both">金额 + 百分比</option>
                 </select>
+              </label>
+              <label>一级维度
+                <select id="compareDimension1"></select>
+              </label>
+              <label>二级维度
+                <select id="compareDimension2"></select>
               </label>
               <button id="compareBtn" type="button">对比</button>
             </div>

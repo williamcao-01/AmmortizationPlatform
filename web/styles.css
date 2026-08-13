@@ -1280,9 +1280,31 @@ th.sticky-col {
   white-space: nowrap;
 }
 
+.compare-value-line {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compare-period-cell strong {
+  margin-top: 3px;
+  font-weight: 800;
+}
+
 .compare-period-cell em {
-  color: var(--gold);
+  font-size: 12px;
   font-style: normal;
+}
+
+.compare-diff-positive {
+  color: #e03131;
+}
+
+.compare-diff-negative {
+  color: #00a86b;
+}
+
+.compare-diff-neutral {
+  color: var(--muted);
 }
 
 .business-explanation p {
@@ -1360,27 +1382,142 @@ th.sticky-col {
   color: #fff;
 }
 
-.scenario-form {
+.scenario-meta-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.5fr) minmax(180px, 0.8fr);
   gap: 12px;
   padding: 16px;
   border-bottom: 1px solid var(--line);
 }
 
-.scenario-form label {
+.scenario-meta-grid label,
+.scenario-selection-grid label,
+.scenario-dynamic-fields label {
   display: grid;
   gap: 6px;
   color: var(--muted);
   font-size: 13px;
 }
 
-.scenario-form button {
-  align-self: end;
+.scenario-composer {
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfd;
+}
+
+.scenario-selection-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 1.5fr) minmax(240px, 1fr);
+  gap: 12px;
+}
+
+.scenario-asset-baseline {
+  display: none;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #d7e5e2;
+  border-radius: 6px;
+  background: #f4f9f8;
+}
+
+.scenario-asset-baseline.active {
+  display: block;
+}
+
+.scenario-baseline-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+.scenario-baseline-head strong {
+  color: var(--ink);
+}
+
+.scenario-baseline-head span,
+.scenario-baseline-note,
+.scenario-field-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.scenario-baseline-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 8px 12px;
+}
+
+.scenario-baseline-grid span {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.scenario-baseline-grid b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.scenario-dynamic-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(170px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+  align-items: end;
+}
+
+.scenario-dynamic-fields:empty {
+  display: none;
+}
+
+.scenario-dynamic-fields .wide-field {
+  grid-column: span 2;
+}
+
+.scenario-dynamic-fields .full-field {
+  grid-column: 1 / -1;
+}
+
+.scenario-readonly-target {
+  display: grid;
+  gap: 4px;
+}
+
+.scenario-readonly-target b {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.scenario-composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+.scenario-composer-actions button,
+.scenario-submit-row button {
   min-height: 38px;
   border-color: var(--accent);
   background: var(--accent);
   color: #fff;
+}
+
+.scenario-submit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px;
+}
+
+.scenario-submit-row span {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 #addScenarioAssumptionBtn {
@@ -1422,6 +1559,11 @@ th.sticky-col {
   display: block;
 }
 
+.scenario-assumption-item .assumption-summary {
+  max-width: 780px;
+  line-height: 1.5;
+}
+
 .scenario-assumption-item span {
   margin-top: 4px;
   color: var(--muted);
@@ -1434,6 +1576,37 @@ th.sticky-col {
   padding: 5px 9px;
   border-color: var(--line);
   background: #fff;
+}
+
+.scenario-list-wrap {
+  border-top: 1px solid var(--line);
+}
+
+.scenario-list-table {
+  min-width: 900px;
+}
+
+.scenario-list-table td small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.scenario-row-actions {
+  white-space: nowrap;
+}
+
+.scenario-row-actions button {
+  min-height: 30px;
+  margin-right: 6px;
+  padding: 4px 9px;
+  border-color: var(--line);
+  background: #fff;
+}
+
+.scenario-row-actions button[data-delete-scenario] {
+  color: #d92d20;
 }
 
 .result-box {
@@ -1979,7 +2152,9 @@ th.sticky-col {
   .explanation-lists,
   .whatif-layout,
   .whatif-form,
-  .scenario-form,
+  .scenario-meta-grid,
+  .scenario-selection-grid,
+  .scenario-dynamic-fields,
   .proof-grid,
   .impact-grid,
   .graph-layout {
@@ -2020,6 +2195,21 @@ th.sticky-col {
 
   .graph-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scenario-baseline-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scenario-dynamic-fields .wide-field,
+  .scenario-dynamic-fields .full-field {
+    grid-column: auto;
+  }
+
+  .scenario-submit-row,
+  .scenario-baseline-head {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .line-chart-values {

@@ -510,6 +510,26 @@ class BusinessResultStore:
     def scenarios(self) -> list[dict[str, Any]]:
         return [self._decorate_scenario(row) for row in self._all("select * from scenarios order by created_at, scenario_id")]
 
+    def delete_scenario(self, scenario_id: str) -> None:
+        if scenario_id == "BASELINE":
+            raise ValueError("基准场景不能删除。")
+        with self._lock:
+            if self.connection.execute("select 1 from scenarios where scenario_id = ?", (scenario_id,)).fetchone() is None:
+                raise ValueError(f"场景不存在：{scenario_id}")
+            for table in (
+                "attribution_lines",
+                "what_if_changes",
+                "rule_executions",
+                "scenario_assumptions",
+                "scenario_metadata",
+                "summary_lines",
+                "forecast_lines",
+                "anomalies",
+                "scenarios",
+            ):
+                self.connection.execute(f"delete from {table} where scenario_id = ?", (scenario_id,))
+            self.connection.commit()
+
     def _decorate_scenario(self, scenario: dict[str, Any]) -> dict[str, Any]:
         metadata = self._one("select * from scenario_metadata where scenario_id = ?", (scenario["scenario_id"],))
         if metadata is None:
@@ -705,6 +725,7 @@ class BusinessResultStore:
         asset_category: str | None = None,
         period_from: str | None = None,
         period_to: str | None = None,
+        dimensions: list[str] | None = None,
     ) -> dict[str, Any]:
         scenario_ids = [item for item in scenario_ids if item]
         baseline = self.wide_table(
@@ -712,6 +733,7 @@ class BusinessResultStore:
             row_type=row_type,
             department=department,
             asset_category=asset_category,
+            dimensions=dimensions,
         )
         scenario_tables = [
             self.wide_table(
@@ -719,6 +741,7 @@ class BusinessResultStore:
                 row_type=row_type,
                 department=department,
                 asset_category=asset_category,
+                dimensions=dimensions,
             )
             for scenario_id in scenario_ids
         ]
@@ -804,13 +827,98 @@ class BusinessResultStore:
                     }
                 )
             rows.append(row)
+        tree_dimensions = baseline.get("dimensions") or ["scope_label"]
+
+        def decimal_sum(items: list[dict[str, Any]], getter) -> Decimal:
+            return sum((Decimal(str(getter(item) or "0.00")) for item in items), ZERO)
+
+        def compare_node(
+            dimension: str,
+            value: str,
+            subset: list[dict[str, Any]],
+            depth: int,
+            path: list[str],
+            children: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            baseline_months = {
+                period: self._money(decimal_sum(subset, lambda row: row["baseline"]["months"].get(period)))
+                for period in periods
+            }
+            baseline_total = self._money(decimal_sum(subset, lambda row: row["baseline"]["annual_total"]))
+            scenario_nodes = []
+            for scenario_id in scenario_ids:
+                scenario_months = {
+                    period: self._money(decimal_sum(
+                        subset,
+                        lambda row: next(
+                            (item["months"].get(period) for item in row["scenarios"] if item["scenario_id"] == scenario_id),
+                            "0.00",
+                        ),
+                    ))
+                    for period in periods
+                }
+                scenario_total = self._money(decimal_sum(
+                    subset,
+                    lambda row: next(
+                        (item["annual_total"] for item in row["scenarios"] if item["scenario_id"] == scenario_id),
+                        "0.00",
+                    ),
+                ))
+                scenario_nodes.append({
+                    "scenario_id": scenario_id,
+                    "annual_total": scenario_total,
+                    "annual_difference": self._money(Decimal(scenario_total) - Decimal(baseline_total)),
+                    "months": scenario_months,
+                    "month_differences": {
+                        period: self._money(Decimal(scenario_months[period]) - Decimal(baseline_months[period]))
+                        for period in periods
+                    },
+                })
+            months = {}
+            for period in periods:
+                values = {baseline_scenario_id: baseline_months[period]}
+                values.update({item["scenario_id"]: item["months"][period] for item in scenario_nodes})
+                primary = scenario_nodes[0] if scenario_nodes else None
+                months[period] = {
+                    **values,
+                    "diff_amount": primary["month_differences"][period] if primary else "0.00",
+                    "diff_percent": self._percent_difference(
+                        primary["months"][period] if primary else baseline_months[period],
+                        baseline_months[period],
+                    ),
+                }
+            return {
+                "id": "|".join([dimension, *path, value]),
+                "dimension": dimension,
+                "value": value,
+                "depth": depth,
+                "baseline": {"scenario_id": baseline_scenario_id, "annual_total": baseline_total, "months": baseline_months},
+                "scenarios": scenario_nodes,
+                "annual_total": baseline_total,
+                "months": months,
+                "children": children,
+            }
+
+        def build_tree(level: int, subset: list[dict[str, Any]], path: list[str]) -> list[dict[str, Any]]:
+            dimension = tree_dimensions[level]
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in subset:
+                groups.setdefault(str(row.get(dimension) or "未设置"), []).append(row)
+            nodes = []
+            for value, grouped_rows in sorted(groups.items(), key=lambda item: item[0]):
+                children = build_tree(level + 1, grouped_rows, [*path, value]) if level + 1 < len(tree_dimensions) else []
+                nodes.append(compare_node(dimension, value, grouped_rows, level, path, children))
+            return nodes
+
         return {
             "baseline_scenario_id": baseline_scenario_id,
             "scenario_ids": scenario_ids,
             "row_type": row_type,
+            "dimensions": baseline.get("dimensions", []),
             "periods": periods,
             "fixed_columns": fixed_columns,
             "rows": rows,
+            "tree": build_tree(0, rows, []),
         }
 
     @staticmethod

@@ -156,9 +156,20 @@ class DemoState:
         self.business_store.close()
 
     def initialize(self) -> None:
-        # The runtime is rebuilt from the current workbook snapshot on every start.
-        # This prevents retired scenarios, forecast lines, and graph objects leaking
-        # into the current customer data set.
+        # Customer scenarios are durable business records. Bootstrap the SQLite stores
+        # only once; subsequent service starts reopen the existing baseline and all
+        # saved What-if scenarios without recalculating or deleting them.
+        if self.business_store.scenario("BASELINE") is not None:
+            if self.graph_store.count_triples() == 0:
+                self._run_forecast(
+                    scenario_id="GRAPH-BOOTSTRAP",
+                    budget_version=self.budget_version,
+                    start_period=self.start_period,
+                    months=self.months,
+                )
+            self._refresh_ontology_model()
+            return
+
         self.business_store.reset()
         self.graph_store.reset()
         if self.is_customer_data:
@@ -262,10 +273,10 @@ class DemoState:
             "calculation_version": self.calculation_version,
             "methods": [
                 {"method": "STRAIGHT_LINE", "label_cn": "年限平均法", "templates": [
-                    {"id": "straight_new_asset", "label_cn": "新增资产", "description_cn": "输入新增资产原值、类别、折旧码和资本化日期。", "fields": ["asset_name", "amount", "asset_category", "depreciation_code", "in_service_date"]},
                     {"id": "straight_impairment", "label_cn": "减值后重算", "description_cn": "对指定资产输入减值金额和生效日期。", "fields": ["asset_id", "amount", "effective_date"]},
                     {"id": "straight_accelerated", "label_cn": "加速折旧", "description_cn": "将指定资产按使用年限 60% 的规则重算。", "fields": ["asset_id"]},
                     {"id": "straight_start_rule", "label_cn": "调整开始计提", "description_cn": "选择当月或次月开始计提。", "fields": ["asset_id", "start_rule"]},
+                    {"id": "straight_new_asset", "label_cn": "新增同类资产", "description_cn": "以所选资产为参照，输入新增资产原值和资本化日期。", "fields": ["asset_name", "amount", "in_service_date"]},
                 ]},
                 {"method": "PRODUCTION", "label_cn": "产量法", "templates": [
                     {"id": "production_driver", "label_cn": "调整区块产量/储量", "description_cn": "按区块和月份输入产量、剩余储量，规则自动识别无产量、无储量和产量超过储量分支。", "fields": ["block_id", "period", "production", "reserves"]},
@@ -735,15 +746,53 @@ class DemoState:
             scenario_ids = [self._payload_scenario_id(item) for item in scenarios_value]
         else:
             scenario_ids = []
-        return self.business_store.wide_table_compare(
+        dimensions_value = payload.get("dimensions") or []
+        if isinstance(dimensions_value, str):
+            dimensions = [item.strip() for item in dimensions_value.split(",") if item.strip()]
+        elif isinstance(dimensions_value, list):
+            dimensions = [str(item).strip() for item in dimensions_value if str(item).strip()]
+        else:
+            dimensions = []
+        table = self.business_store.wide_table_compare(
             baseline_scenario_id=baseline,
             scenario_ids=[item for item in scenario_ids if item and item != baseline],
-            row_type=str(payload.get("row_type") or "asset"),
+            row_type=str(payload.get("row_type") or "overview"),
             department=str(payload.get("department")) if payload.get("department") else None,
             asset_category=str(payload.get("asset_category")) if payload.get("asset_category") else None,
             period_from=str(payload.get("period_from")) if payload.get("period_from") else None,
             period_to=str(payload.get("period_to")) if payload.get("period_to") else None,
+            dimensions=dimensions,
         )
+        return self._decorate_compare_wide_table(table)
+
+    def _decorate_compare_wide_table(self, table: dict[str, object]) -> dict[str, object]:
+        catalog = self.wide_table_dimension_catalog()
+        dimension_labels = {str(item["id"]): str(item["label_cn"]) for item in catalog.get("dimensions", [])}
+        dimension_labels["scope_label"] = "总览"
+        category_labels = catalog.get("category_labels", {})
+        asset_labels = catalog.get("asset_labels", {})
+        code_labels = catalog.get("depreciation_code_labels", {})
+
+        def label_for(dimension: str, value: str) -> str:
+            if dimension == "asset_category":
+                return f"{category_labels.get(value, value)}（{value}）"
+            if dimension == "asset":
+                return f"{asset_labels.get(value, value)}（{value}）"
+            if dimension == "depreciation_code":
+                return f"{code_labels.get(value, value)}（{value}）"
+            return value
+
+        def decorate(nodes: list[dict[str, object]]) -> None:
+            for node in nodes:
+                dimension = str(node.get("dimension") or "")
+                value = str(node.get("value") or "")
+                node["dimension_label_cn"] = dimension_labels.get(dimension, dimension)
+                node["label_cn"] = label_for(dimension, value)
+                decorate(node.get("children", []))
+
+        decorate(table.get("tree", []))
+        table["dimension_catalog"] = catalog
+        return table
 
     def ask_wide_table_question(self, payload: dict[str, object]) -> dict[str, object]:
         self._validate_period_range(
@@ -1263,6 +1312,51 @@ class DemoState:
         executions = self.business_store.rule_executions(scenario_id=scenario_id, asset_refs=[asset_ref])
         policy = self.policy_narrative(asset_ref, scenario_id)
         applicable_policy = policy.get("applicable_policy") or {}
+        source_asset = next(
+            (item for item in self.repository.load_fixed_assets() if item.asset_id == asset_ref),
+            None,
+        )
+        driver_type = str(asset.get("depreciation_method") or "")
+        driver_target = ""
+        if source_asset and driver_type == "PRODUCTION":
+            driver_target = source_asset.block_id or ""
+        elif source_asset and driver_type == "WORKLOAD":
+            driver_target = source_asset.organization_id or source_asset.company
+        driver_context: dict[str, object] | None = None
+        if driver_target:
+            expected_driver_type = "PRODUCTION" if driver_type == "PRODUCTION" else "WORKLOAD"
+            driver_rows = [
+                item for item in self.repository.baseline_drivers(start_period=self.start_period, months=self.months)
+                if item.driver_type == expected_driver_type and item.target_id == driver_target
+            ]
+            driver_context = {
+                "driver_type": expected_driver_type,
+                "target_id": driver_target,
+                "target_label_cn": (
+                    f"区块 {driver_target}" if expected_driver_type == "PRODUCTION"
+                    else f"所属单位 {driver_target}"
+                ),
+                "by_period": {
+                    str(item.period): {
+                        "production": str(item.production),
+                        "reserves": str(item.reserves),
+                        "workload": str(item.workload),
+                        "unit_fee": str(item.unit_fee),
+                        "total_amortization": (
+                            str(item.total_amortization) if item.total_amortization is not None else ""
+                        ),
+                        "assumption_note": item.assumption_note,
+                    }
+                    for item in driver_rows
+                },
+            }
+        source_context = {
+            "block_id": source_asset.block_id if source_asset else None,
+            "organization_id": source_asset.organization_id if source_asset else None,
+            "useful_life_months": source_asset.useful_life_months if source_asset else applicable_policy.get("useful_life_months"),
+            "residual_rate": str(source_asset.residual_rate) if source_asset and source_asset.residual_rate is not None else applicable_policy.get("residual_rate"),
+            "start_rule": source_asset.start_rule if source_asset else applicable_policy.get("start_rule"),
+        }
         relationships = [
             {"label_cn": "归属所属单位", "value_cn": asset.get("department") or "未登记"},
             {"label_cn": "归属成本中心", "value_cn": asset.get("cost_center") or "未登记"},
@@ -1279,6 +1373,8 @@ class DemoState:
             "relationships": relationships,
             "forecast_lines": forecast_lines,
             "rule_executions": executions,
+            "source_context": source_context,
+            "driver_context": driver_context,
             "message_cn": "",
         }
 
@@ -2194,6 +2290,11 @@ class DemoState:
             "attributions": self.business_store.attributions(scenario_id),
         }
 
+    def delete_scenario(self, scenario_id: str) -> dict[str, object]:
+        self.business_store.delete_scenario(scenario_id)
+        self._refresh_ontology_model()
+        return {"scenario_id": scenario_id, "deleted": True, "message_cn": "场景及其计算结果已删除。"}
+
     def create_customer_scenario(self, payload: dict[str, object], *, scenario_id: str | None = None) -> dict[str, object]:
         base_scenario_id = str(payload.get("base_scenario_id") or "BASELINE")
         assumptions_value = payload.get("assumptions") or []
@@ -2316,12 +2417,16 @@ class DemoState:
                 for driver in changed_drivers:
                     if driver.driver_type == driver_type and driver.target_id == driver_target and str(driver.period) == driver_period:
                         matched = True
+                        def scenario_value(field_name: str, baseline: Decimal) -> Decimal:
+                            value = assumption.get(field_name)
+                            return Decimal(str(baseline if value in (None, "") else value))
+
                         next_drivers.append(replace(
                             driver,
-                            production=Decimal(str(assumption.get("production") or driver.production)),
-                            reserves=Decimal(str(assumption.get("reserves") or driver.reserves)),
-                            workload=Decimal(str(assumption.get("workload") or driver.workload)),
-                            unit_fee=Decimal(str(assumption.get("unit_fee") or driver.unit_fee)),
+                            production=scenario_value("production", driver.production),
+                            reserves=scenario_value("reserves", driver.reserves),
+                            workload=scenario_value("workload", driver.workload),
+                            unit_fee=scenario_value("unit_fee", driver.unit_fee),
                             total_amortization=(
                                 Decimal(str(assumption["total_amortization"]))
                                 if assumption.get("total_amortization") not in (None, "")
@@ -2539,16 +2644,29 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
                 incoming = payload.get("assumptions") or [payload]
                 if not isinstance(incoming, list):
                     incoming = [incoming]
-                merged = [*existing["assumptions"], *incoming]
+                merged = incoming if payload.get("replace_existing") else [*existing["assumptions"], *incoming]
                 self._json(self.state.create_customer_scenario({
                     "base_scenario_id": existing["scenario"].get("base_scenario_id") or "BASELINE",
-                    "scenario_name": existing["scenario"].get("scenario_name") or scenario_id,
-                    "description": existing["scenario"].get("description") or "规则场景更新。",
+                    "scenario_name": payload.get("scenario_name") or existing["scenario"].get("scenario_name") or scenario_id,
+                    "description": payload.get("description") or existing["scenario"].get("description") or "规则场景更新。",
                     "assumptions": merged,
                     "assumptions_include_base": True,
                 }, scenario_id=scenario_id))
             else:
                 self._json(self.state.run_what_if(payload))
+        except ValueError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            self._json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if not (parsed.path.startswith("/api/scenarios/") and parsed.path.count("/") == 3):
+            self._json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            scenario_id = parsed.path.rsplit("/", maxsplit=1)[-1]
+            self._json(self.state.delete_scenario(scenario_id))
         except ValueError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
