@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from depreciation_poc.qa.reverse_planning import ReversePlanningSkill
 from depreciation_poc.qa.skill import FallbackWideTableQAProvider, WideTableQASkill
 from depreciation_poc.qa.skill import ConversationState
 
@@ -210,6 +211,36 @@ class WideTableQAProviderTest(unittest.TestCase):
         self.assertEqual(result[0]["asset_ref"], "ASSET-TEST-001")
         self.assertNotIn("path_nodes", result[0])
         self.assertNotIn("technical_details", result[0])
+
+    def test_reverse_planning_treats_reduce_amount_as_relative_change(self):
+        direction, amount = ReversePlanningSkill._relative_change_from_question(
+            "7月公司整体折旧减少6万元"
+        )
+        self.assertEqual(direction, "decrease")
+        self.assertEqual(amount, Decimal("60000"))
+        self.assertIsNone(
+            ReversePlanningSkill._relative_change_from_question("7月公司整体折旧降至6万元")
+        )
+
+    def test_reverse_planning_keeps_distinct_same_strategy_alternatives(self):
+        skill = object.__new__(ReversePlanningSkill)
+        simulations = [
+            {
+                "target_amount": "940.00", "gap": "0.00", "affected_object_count": 1,
+                "actions": [{"template_id": "straight_impairment", "target_object": "A-001"}],
+            },
+            {
+                "target_amount": "941.00", "gap": "1.00", "affected_object_count": 1,
+                "actions": [{"template_id": "straight_impairment", "target_object": "A-002"}],
+            },
+            {
+                "target_amount": "942.00", "gap": "2.00", "affected_object_count": 1,
+                "actions": [{"template_id": "straight_impairment", "target_object": "A-003"}],
+            },
+        ]
+        selected = skill._select_distinct_recommendations(simulations)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[1]["selection_label_cn"], "同策略资产组合备选")
 
 
 if __name__ == "__main__":

@@ -820,6 +820,30 @@ tbody tr:hover {
   font-size: 16px;
 }
 
+.reverse-feasibility,
+.reverse-evaluation {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: #344054;
+  font-size: 13px;
+  line-height: 1.65;
+  background: #fbfcfd;
+}
+
+.reverse-feasibility.verified {
+  border-color: #85c8b8;
+  background: #effaf6;
+  color: #146c5a;
+}
+
+.reverse-feasibility.limited {
+  border-color: #e7be69;
+  background: #fff9ed;
+  color: #7a4c08;
+}
+
 .reverse-plan-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

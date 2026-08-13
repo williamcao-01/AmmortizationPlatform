@@ -656,11 +656,38 @@ class DemoState:
         delta = Decimal(str(analysis["required_delta"]))
         direction = str(analysis.get("direction") or ("increase" if delta > 0 else "decrease"))
         candidates: list[dict[str, object]] = []
-        straight = sorted(
-            [item for item in assets if item.depreciation_code in ("Z111", "Z112")],
-            key=lambda item: item.original_cost - item.accumulated_depreciation - item.accumulated_impairment,
+        target_lines = self._harness_forecast_lines(
+            scenario_id=str(analysis.get("scenario_id") or "BASELINE"),
+            period_from=str(target_period),
+            period_to=str(target_period),
+            limit=10000,
+        )
+        target_monthly_amount = {
+            str(row.get("asset_id") or row.get("planned_asset_id") or ""): Decimal(str(row.get("monthly_depreciation") or "0"))
+            for row in target_lines
+        }
+        straight_all = sorted(
+            [
+                item for item in assets
+                if item.depreciation_code in ("Z111", "Z112")
+                and target_monthly_amount.get(item.asset_id, Decimal("0")) > 0
+            ],
+            key=lambda item: target_monthly_amount.get(item.asset_id, Decimal("0")),
             reverse=True,
         )
+        # A full Cartesian product of all assets is neither usable nor necessary.
+        # Select a target-month pool whose observed monthly depreciation can cover
+        # three times the requested change, retaining at least eight alternatives.
+        straight: list[FixedAsset] = []
+        covered = Decimal("0")
+        required_coverage = max(abs(delta) * Decimal("3"), Decimal("1"))
+        for item in straight_all:
+            straight.append(item)
+            covered += target_monthly_amount.get(item.asset_id, Decimal("0"))
+            if len(straight) >= 8 and covered >= required_coverage:
+                break
+            if len(straight) >= 16:
+                break
         if direction != "decrease" and straight:
             reference = straight[0]
             life = Decimal(str(reference.useful_life_months or 120))
@@ -671,10 +698,16 @@ class DemoState:
                             "amount": str(amount), "in_service_date": f"{in_service.year:04d}-{in_service.month:02d}-01"}]
             candidates.append({"action_key": "new_asset", "actions": [{"label_cn": f"新增资产（参考 {reference.asset_id}）", "template_id": "straight_new_asset", "target_object": reference.asset_id}], "assumptions": assumptions, "affected_object_count": 1})
         if direction != "increase":
-            for asset in straight[:4]:
-                amount = min(asset.original_cost, max(Decimal("1"), abs(delta) * Decimal(str(asset.useful_life_months or 120))))
+            for asset in straight:
+                available_amount = max(
+                    Decimal("0"),
+                    asset.original_cost - asset.accumulated_depreciation - asset.accumulated_impairment,
+                )
+                if available_amount <= 0:
+                    continue
+                amount = available_amount
                 candidates.append({"action_key": f"impair:{asset.asset_id}", "actions": [{"label_cn": f"{asset.asset_id} 减值后重算", "template_id": "straight_impairment", "target_object": asset.asset_id, "notice_cn": "减值为业务假设，需按财务制度确认。"}],
-                                   "assumptions": [{"template_id": "straight_impairment", "asset_id": asset.asset_id, "amount": str(amount), "effective_date": f"{target_period.year:04d}-{target_period.month:02d}-01"}], "affected_object_count": 1})
+                                   "assumptions": [{"template_id": "straight_impairment", "asset_id": asset.asset_id, "amount": str(amount), "effective_date": f"{target_period.year:04d}-{target_period.month:02d}-01"}], "affected_object_count": 1, "tunable_amount_field": "amount"})
         if direction != "decrease":
             for asset in straight[:4]:
                 candidates.append({"action_key": f"accelerate:{asset.asset_id}", "actions": [{"label_cn": f"{asset.asset_id} 加速折旧", "template_id": "straight_accelerated", "target_object": asset.asset_id}],
@@ -2595,6 +2628,9 @@ class DemoState:
                 if asset is None:
                     raise ValueError(f"未找到减值目标资产：{target_id}")
                 amount = Decimal(str(assumption.get("amount") or "0"))
+                available_amount = max(Decimal("0"), asset.original_cost - asset.accumulated_depreciation - asset.accumulated_impairment)
+                if amount > available_amount:
+                    raise ValueError(f"减值金额不能超过资产当前可减值金额 {available_amount:.2f}。")
                 effective = parse_date(str(assumption.get("effective_date") or ""))
                 if effective is None:
                     raise ValueError("减值场景需要生效日期。")
