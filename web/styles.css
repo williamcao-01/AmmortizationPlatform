@@ -1960,6 +1960,12 @@ th.sticky-col {
   font-size: 13px;
 }
 
+.graph-object-row .graph-entity-ref {
+  color: #08776d;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
 .graph-object-row small {
   color: var(--muted);
   font-size: 11px;
