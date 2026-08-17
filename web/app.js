@@ -839,7 +839,11 @@ const renderReversePlanningResult = (result) => {
   const analysis = result.question_analysis || {};
   const recommendations = asArray(result.recommendations);
   const cards = recommendations.map((plan, index) => {
-    const actions = asArray(plan.actions).map((action) => `<li><strong>${escapeHtml(action.label_cn)}</strong>${action.notice_cn ? `<span>${escapeHtml(action.notice_cn)}</span>` : ""}</li>`).join("");
+    const actions = asArray(plan.actions).map((action) => {
+      const parameters = asArray(action.recommended_parameters);
+      const parameterText = action.recommendation_cn || parameters.map((item) => item.label_cn).filter(Boolean).join("；");
+      return `<li><strong>${escapeHtml(action.label_cn)}</strong>${parameterText ? `<span class="reverse-action-parameter">${escapeHtml(parameterText)}</span>` : ""}${action.notice_cn ? `<span>${escapeHtml(action.notice_cn)}</span>` : ""}</li>`;
+    }).join("");
     const rules = asArray(plan.rule_execution_trace).slice(0, 8).map((rule) => `<li>${escapeHtml(`${rule.asset_ref} · ${rule.branch_id} · ${rule.conclusion_cn}`)}</li>`).join("");
     return `<article class="reverse-plan-card">
       <div class="reverse-plan-head"><span>方案 ${index + 1} · ${escapeHtml(plan.selection_label_cn || "推荐方案")}</span><strong>目标偏差 ${money(plan.gap)}</strong></div>
@@ -934,15 +938,6 @@ const renderWideQuestionResult = (result) => {
     ["问题理解", modelCalls.question_understanding],
     ["业务表述", modelCalls.answer_composition],
   ].map(([label, call]) => `<div><span>${escapeHtml(label)}</span><strong>${call?.used_llm ? `DeepSeek${call.model ? ` · ${call.model}` : ""}` : "未调用模型"}</strong><small>${call?.latency_ms ? `${call.latency_ms} ms` : (call?.fallback_reason || "")}</small></div>`).join("");
-  const executionRows = asArray(result.rule_execution_trace).map((item) => `
-    <tr>
-      <td>${escapeHtml(item.asset_ref)}</td>
-      <td>${escapeHtml(item.period)}</td>
-      <td>${escapeHtml(ruleBranchDisplay(item.branch_id))}</td>
-      <td>${escapeHtml(item.formula_cn)}</td>
-      <td>${escapeHtml(item.conclusion_cn)}</td>
-    </tr>
-  `).join("");
   el("wideQuestionResult").innerHTML = `
     <section class="skill-status ${qaSkill.used_llm ? "llm" : "fallback"}">
       <div>
@@ -982,18 +977,9 @@ const renderWideQuestionResult = (result) => {
       <div class="answer-card"><span>结论</span><p>${escapeHtml(result.answer_cn || "暂无回答")}</p><small>审计编号：${escapeHtml(result.audit_id || "-")} · ${escapeHtml(result.answer_validation?.reason_cn || "")}</small></div>
     </section>
     <section>
-      <h3>规则执行证据</h3>
-      <div class="table-wrap compact">
-        <table>
-          <thead><tr><th>资产</th><th>月份</th><th>命中分支</th><th>公式</th><th>业务结论</th></tr></thead>
-          <tbody>${executionRows || `<tr><td colspan="5">当前问题没有需要展开的规则执行记录</td></tr>`}</tbody>
-        </table>
-      </div>
-    </section>
-    <section>
       <h3>${facts.drivers ? "差异驱动资产" : "主要贡献资产"}</h3>
       ${significantSummary ? `<p class="table-note">${escapeHtml(significantSummary)}</p>` : ""}
-      <div class="table-wrap compact">
+      <div class="table-wrap compact driver-asset-table-wrap">
         <table>
           <thead><tr><th>资产</th><th>类别</th><th>政策</th><th>上期</th><th>本期</th><th>差异</th><th>原因</th></tr></thead>
           <tbody>${assetRows || `<tr><td colspan="7">暂无相关资产</td></tr>`}</tbody>
@@ -1632,7 +1618,7 @@ const formatComparePeriodValue = (value, payload) => {
   }
   if ((payload.diff_mode === "percent" || payload.diff_mode === "both") && diffPercent !== "") {
     const number = Number(diffPercent) <= 1 ? Number(diffPercent) * 100 : Number(diffPercent);
-    diffLines.push(`<em class="${diffClass}">${number > 0 ? "+" : ""}${percent(number)}</em>`);
+    diffLines.push(`<strong class="${diffClass}">差异: ${number > 0 ? "+" : ""}${percent(number)}</strong>`);
   }
   return [...scenarioLines, ...diffLines].join("") || escapeHtml(JSON.stringify(value));
 };
@@ -1714,7 +1700,8 @@ const renderGraphExplorer = () => {
   renderGraphKpis(state.graph?.summary || {});
   renderGraphTypeModel();
   const selectedType = asArray(state.graph?.object_types).find((item) => item.type_id === state.graphSelectedType);
-  el("graphObjectListTitle").textContent = selectedType ? `${selectedType.label_cn || selectedType.type_id}实体清单` : "业务实体清单";
+  const isFixedAssetList = selectedType?.type_id === "FixedAsset";
+  el("graphObjectListTitle").textContent = isFixedAssetList ? "资产编号" : (selectedType ? `${selectedType.label_cn || selectedType.type_id}实体清单` : "业务实体清单");
   el("graphObjectCount").textContent = selectedType ? `显示 ${nodes.length}` : "请先选择类型";
   const list = el("graphObjectList");
   if (!selectedType) {
@@ -1724,11 +1711,18 @@ const renderGraphExplorer = () => {
   }
   list.innerHTML = nodes.map((node) => {
     const id = node.id || node.object_id;
-    const assetRef = node.properties?.asset_ref || node.metrics?.asset_ref || "";
-    return `<button type="button" class="graph-object-row ${state.graphSelectedNodeId === id ? "selected" : ""}" data-graph-node-id="${escapeHtml(id)}">
-      <span class="graph-object-type">${escapeHtml(node.type_label_cn || node.object_type || "业务对象")}</span>
-      <strong class="graph-entity-ref">${escapeHtml(assetRef || node.label_cn || id)}</strong>
-      <small>${escapeHtml(assetRef ? (node.properties?.name || node.subtitle_cn || "") : (node.subtitle_cn || node.technical_ref || ""))}</small>
+    const assetRef = node.properties?.asset_ref
+      || node.metrics?.asset_ref
+      || (node.object_type === "FixedAsset" ? String(node.technical_ref || id).replace(/^FixedAsset:/, "") : "");
+    const primaryLabel = isFixedAssetList ? assetRef : (assetRef || node.label_cn || id);
+    const secondaryLabel = isFixedAssetList
+      ? `资产名称：${node.properties?.name || node.subtitle_cn || "-"}`
+      : (assetRef ? (node.properties?.name || node.subtitle_cn || "") : (node.subtitle_cn || node.technical_ref || ""));
+    const rowLabel = isFixedAssetList ? "资产编号" : (node.type_label_cn || node.object_type || "业务对象");
+    return `<button type="button" class="graph-object-row ${isFixedAssetList ? "asset-entity-row" : ""} ${state.graphSelectedNodeId === id ? "selected" : ""}" data-graph-node-id="${escapeHtml(id)}">
+      <span class="graph-object-type">${escapeHtml(rowLabel)}</span>
+      <strong class="graph-entity-ref">${escapeHtml(primaryLabel)}</strong>
+      <small>${escapeHtml(secondaryLabel)}</small>
     </button>`;
   }).join("") || `<p class="empty-note">没有匹配的业务对象。</p>`;
   list.querySelectorAll("[data-graph-node-id]").forEach((button) => {

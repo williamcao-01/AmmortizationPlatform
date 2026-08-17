@@ -614,6 +614,23 @@ class ReversePlanningSkill:
             recommendation["recommendation_number"] = index
             recommendation["scenario_written"] = False
             recommendation["assumption_notice_cn"] = "本方案仅为临时业务假设，尚未创建或保存 What-if 场景。"
+            for action in recommendation.get("actions", []):
+                template_id = str(action.get("template_id") or "")
+                target_object = str(action.get("target_object") or "")
+                assumption = next((
+                    item for item in recommendation.get("assumptions", [])
+                    if str(item.get("template_id") or "") == template_id
+                    and str(item.get("asset_id") or item.get("reference_asset_id") or item.get("block_id") or item.get("company") or "") == target_object
+                ), None)
+                if template_id != "straight_impairment" or not assumption:
+                    continue
+                amount = Decimal(str(assumption.get("amount") or "0")).quantize(Decimal("0.01"))
+                effective_date = str(assumption.get("effective_date") or "-")
+                action["recommended_parameters"] = [
+                    {"field": "amount", "label_cn": f"建议减值金额：{amount:,.2f}"},
+                    {"field": "effective_date", "label_cn": f"建议生效月份：{effective_date}"},
+                ]
+                action["recommendation_cn"] = f"建议减值金额：{amount:,.2f}；建议生效月份：{effective_date}"
 
     @staticmethod
     def _template_answer(plan: dict[str, Any], baseline: Decimal, target: Decimal, recommendations: list[dict[str, Any]]) -> str:

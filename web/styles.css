@@ -664,6 +664,19 @@ h3 {
   max-height: 520px;
 }
 
+.table-wrap.compact.driver-asset-table-wrap {
+  max-height: 380px;
+  overflow: scroll;
+  scrollbar-gutter: stable both-edges;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.driver-asset-table-wrap table {
+  width: 1640px;
+  min-width: 1640px;
+}
+
 .table-note {
   margin: 0 0 10px;
   color: var(--muted);
@@ -763,8 +776,28 @@ tbody tr:hover {
 
 .wide-question-result {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   padding: 16px;
+  min-width: 0;
+}
+
+.wide-question-result > section,
+.wide-question-result .reason-step,
+.wide-question-result .ontology-path-list li,
+.wide-question-result .answer-card,
+.wide-question-result .tool-trace li {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.wide-question-result .table-wrap {
+  max-width: 100%;
+}
+
+.wide-question-result :is(.reason-step p, .ontology-path-list span, .answer-card p, .answer-card small) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .reverse-chat,
@@ -1312,11 +1345,6 @@ th.sticky-col {
 .compare-period-cell strong {
   margin-top: 3px;
   font-weight: 800;
-}
-
-.compare-period-cell em {
-  font-size: 12px;
-  font-style: normal;
 }
 
 .compare-diff-positive {
@@ -1964,6 +1992,15 @@ th.sticky-col {
   color: #08776d;
   font-size: 14px;
   font-variant-numeric: tabular-nums;
+}
+
+.graph-object-row.asset-entity-row {
+  min-height: 76px;
+}
+
+.graph-object-row.asset-entity-row .graph-entity-ref {
+  font-size: 15px;
+  letter-spacing: 0;
 }
 
 .graph-object-row small {
