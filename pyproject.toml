@@ -3,6 +3,7 @@ name = "asset-depreciation-ontology-poc"
 version = "0.1.0"
 description = "Sample POC for ontology-driven asset depreciation forecasting."
 requires-python = ">=3.11"
+dependencies = ["neo4j>=5.28,<6"]
 
 [tool.unittest]
 start-directory = "tests"

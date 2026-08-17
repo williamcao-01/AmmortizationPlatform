@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -17,13 +18,14 @@ class CustomerSingleSourceTest(unittest.TestCase):
     def make_state(self, root: Path) -> DemoState:
         repository = CustomerExcelRepository(DATA_DIR)
         start_period = Month.parse(repository.source_summary()["snapshot_period"]).add(1)
-        return DemoState(
-            customer_data_dir=DATA_DIR,
-            graph_db_path=root / "graph.sqlite",
-            business_db_path=root / "business.sqlite",
-            start_period=start_period,
-            months=repository.verified_forecast_months(start_period, maximum=6),
-        )
+        with patch.dict("os.environ", {"NEO4J_ENABLED": "false"}):
+            return DemoState(
+                customer_data_dir=DATA_DIR,
+                graph_db_path=root / "graph.sqlite",
+                business_db_path=root / "business.sqlite",
+                start_period=start_period,
+                months=repository.verified_forecast_months(start_period, maximum=6),
+            )
 
     def test_only_current_workbooks_and_covered_periods_are_used(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -78,6 +80,27 @@ class CustomerSingleSourceTest(unittest.TestCase):
                 self.assertTrue(detail["driver_context"]["target_id"])
                 self.assertIn("2026-07", detail["driver_context"]["by_period"])
                 self.assertIn("useful_life_months", detail["source_context"])
+            finally:
+                state.close()
+
+    def test_knowledge_graph_contains_only_customer_business_objects_and_exposes_node_details(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            try:
+                graph = state.knowledge_graph({"scenario_id": ["BASELINE"], "focus": ["full"]})
+                assets = [item for item in graph["nodes"] if item["object_type"] == "FixedAsset"]
+                self.assertEqual(len(assets), 279)
+                self.assertFalse(any(str(item["technical_ref"]).startswith(("PA-", "FA-")) for item in assets))
+                self.assertTrue(all("客户" in str(item["source_system"]) for item in assets))
+                self.assertGreater(graph["summary"]["edge_count"], 0)
+
+                detail = state.knowledge_graph_node({
+                    "scenario_id": ["BASELINE"],
+                    "id": [str(assets[0]["id"])],
+                })
+                self.assertEqual(detail["node"]["object_id"], assets[0]["id"])
+                self.assertTrue(detail["related_nodes"])
+                self.assertIn("asset_ref", detail["node"]["properties"])
             finally:
                 state.close()
 

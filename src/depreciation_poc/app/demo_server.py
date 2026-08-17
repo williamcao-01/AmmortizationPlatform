@@ -24,6 +24,7 @@ from depreciation_poc.infrastructure.business_store import BusinessResultStore
 from depreciation_poc.infrastructure.customer_excel_repository import CustomerExcelRepository
 from depreciation_poc.infrastructure.env_loader import load_local_env
 from depreciation_poc.infrastructure.graph_store import SQLiteGraphStore
+from depreciation_poc.infrastructure.neo4j_graph_store import Neo4jOntologyStore
 from depreciation_poc.ontology_model import (
     ACTION_TYPES,
     FUNCTION_TYPES,
@@ -122,6 +123,7 @@ class DemoState:
         self.repository = CustomerExcelRepository(customer_data_dir)
         self.graph_store = SQLiteGraphStore(graph_db_path)
         self.business_store = BusinessResultStore(business_db_path)
+        self.neo4j_store = self._open_neo4j_store()
         self.perspective = "BUDGET"
         snapshot_period = self.repository.source_summary().get("snapshot_period")
         self.budget_version = f"CUSTOMER-{snapshot_period}"
@@ -131,21 +133,25 @@ class DemoState:
         self.explanation_harness = self._build_explanation_harness()
         self.wide_table_qa_skill = WideTableQASkill(
             tools=WideTableQATools(
-                forecast_lines=self.business_store.forecast_lines,
+                forecast_lines=self._harness_forecast_lines,
                 knowledge_graph_path=self.knowledge_graph_path,
                 policy_narrative=self.policy_narrative,
-                rule_executions=self.business_store.rule_executions,
-                available_periods=self._forecast_periods,
+                rule_executions=self._harness_rule_executions,
+                available_periods=self._harness_available_periods,
+                entity_catalog=self._harness_entity_catalog,
+                graph_read_status=self._harness_graph_read_status,
             ),
             provider=FallbackWideTableQAProvider(),
         )
         self.reverse_planning_skill = ReversePlanningSkill(
             tools=ReversePlanningTools(
-                forecast_lines=self.business_store.forecast_lines,
+                forecast_lines=self._harness_forecast_lines,
                 candidate_actions=self._reverse_candidate_actions,
                 simulate=self._simulate_reverse_assumptions,
                 ontology_path=self._reverse_ontology_paths,
                 catalog=self.reverse_planning_catalog,
+                eligible_asset_refs=self._harness_eligible_asset_refs,
+                graph_read_status=self._harness_graph_read_status,
             ),
             provider=FallbackWideTableQAProvider(),
         )
@@ -154,6 +160,27 @@ class DemoState:
     def close(self) -> None:
         self.graph_store.close()
         self.business_store.close()
+        if self.neo4j_store is not None:
+            self.neo4j_store.close()
+
+    @staticmethod
+    def _open_neo4j_store() -> Neo4jOntologyStore | None:
+        if os.environ.get("NEO4J_ENABLED", "false").lower() not in {"1", "true", "yes"}:
+            return None
+        uri = os.environ.get("NEO4J_URI", "").strip()
+        password = os.environ.get("NEO4J_PASSWORD", "")
+        if not uri or not password:
+            return None
+        try:
+            return Neo4jOntologyStore(
+                uri=uri,
+                username=os.environ.get("NEO4J_USERNAME", "neo4j"),
+                password=password,
+                database=os.environ.get("NEO4J_DATABASE", "neo4j"),
+            )
+        except Exception as exc:
+            logging.getLogger("depreciation_poc").warning("Neo4j unavailable; using SQLite ontology mirror: %s", exc)
+            return None
 
     def initialize(self) -> None:
         # Customer scenarios are durable business records. Bootstrap the SQLite stores
@@ -260,6 +287,7 @@ class DemoState:
             "business_db_updated_at": scenario["updated_at"] if scenario else None,
             "triple_count": self.graph_store.count_triples(),
             "inferred_triple_count": self.graph_store.count_triples(inferred=True),
+            "neo4j": self.neo4j_store.counts() if self.neo4j_store is not None else {"enabled": False},
         }
         if self.is_customer_data:
             status["snapshot"] = self.business_store.snapshot_status(self.snapshot_id)
@@ -309,6 +337,53 @@ class DemoState:
             for line in self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
             if line.get("period")
         })
+
+    def _harness_forecast_lines(self, **filters: object) -> list[dict[str, object]]:
+        """Use Neo4j as the read model for agent evidence; SQLite remains the calculation store."""
+        if self.neo4j_store is not None:
+            return self.neo4j_store.forecast_lines(**filters)  # type: ignore[arg-type]
+        return self.business_store.forecast_lines(**filters)  # type: ignore[arg-type]
+
+    def _harness_available_periods(self, scenario_id: str) -> list[str]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.available_periods(scenario_id)
+        return self._forecast_periods(scenario_id)
+
+    def _harness_rule_executions(self, **filters: object) -> list[dict[str, object]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.rule_executions(**filters)  # type: ignore[arg-type]
+        return self.business_store.rule_executions(**filters)  # type: ignore[arg-type]
+
+    def _harness_entity_catalog(self, scenario_id: str) -> dict[str, list[str]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.entity_catalog(scenario_id)
+        lines = self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
+        return {
+            "companies": sorted({str(item.get("company")) for item in lines if item.get("company")}),
+            "departments": sorted({str(item.get("department")) for item in lines if item.get("department")}),
+            "asset_categories": sorted({str(item.get("asset_category")) for item in lines if item.get("asset_category")}),
+            "asset_refs": sorted({str(item.get("asset_id") or item.get("planned_asset_id")) for item in lines if item.get("asset_id") or item.get("planned_asset_id")}),
+        }
+
+    def _harness_eligible_asset_refs(self, *, scenario_id: str, scope_type: str, scope_value: str) -> list[str]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.eligible_asset_refs(
+                scenario_id=scenario_id,
+                scope_type=scope_type,
+                scope_value=scope_value,
+            )
+        return [
+            item.asset_id
+            for item in self.repository.load_fixed_assets()
+            if self._matches_reverse_scope(item, {"scope_type": scope_type, "scope_value": scope_value})
+        ]
+
+    def _harness_graph_read_status(self) -> dict[str, object]:
+        return {
+            "active": self.neo4j_store is not None,
+            "database": "Neo4j Community" if self.neo4j_store is not None else "SQLite",
+            "query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQL fallback",
+        }
 
     def summaries(self, query: dict[str, list[str]]) -> list[dict[str, object]]:
         return self.business_store.summaries(
@@ -541,7 +616,7 @@ class DemoState:
         return self.wide_table_qa_skill.catalog(self._str_arg(query, "scenario_id", "BASELINE"))
 
     def reverse_planning_catalog(self, scenario_id: str = "BASELINE") -> dict[str, object]:
-        lines = self.business_store.forecast_lines(scenario_id=scenario_id, limit=10000)
+        lines = self._harness_forecast_lines(scenario_id=scenario_id, limit=10000)
         scopes: list[dict[str, object]] = []
         for scope_type, field, label in (("company", "company", "公司"), ("department", "department", "所属单位"), ("asset_category", "asset_category", "资产类别")):
             values = sorted({str(line.get(field) or "") for line in lines if line.get(field)})
@@ -571,16 +646,48 @@ class DemoState:
                 or (analysis.get("scope_type") == "asset_category" and asset.asset_category == analysis.get("scope_value")))
 
     def _reverse_candidate_actions(self, analysis: dict[str, object]) -> list[dict[str, object]]:
-        assets = [item for item in self.repository.load_fixed_assets() if self._matches_reverse_scope(item, analysis)]
+        eligible_refs = set(self._harness_eligible_asset_refs(
+            scenario_id=str(analysis.get("scenario_id") or "BASELINE"),
+            scope_type=str(analysis["scope_type"]),
+            scope_value=str(analysis["scope_value"]),
+        ))
+        assets = [item for item in self.repository.load_fixed_assets() if item.asset_id in eligible_refs]
         target_period = Month.parse(str(analysis["target_period"]))
         delta = Decimal(str(analysis["required_delta"]))
         direction = str(analysis.get("direction") or ("increase" if delta > 0 else "decrease"))
         candidates: list[dict[str, object]] = []
-        straight = sorted(
-            [item for item in assets if item.depreciation_code in ("Z111", "Z112")],
-            key=lambda item: item.original_cost - item.accumulated_depreciation - item.accumulated_impairment,
+        target_lines = self._harness_forecast_lines(
+            scenario_id=str(analysis.get("scenario_id") or "BASELINE"),
+            period_from=str(target_period),
+            period_to=str(target_period),
+            limit=10000,
+        )
+        target_monthly_amount = {
+            str(row.get("asset_id") or row.get("planned_asset_id") or ""): Decimal(str(row.get("monthly_depreciation") or "0"))
+            for row in target_lines
+        }
+        straight_all = sorted(
+            [
+                item for item in assets
+                if item.depreciation_code in ("Z111", "Z112")
+                and target_monthly_amount.get(item.asset_id, Decimal("0")) > 0
+            ],
+            key=lambda item: target_monthly_amount.get(item.asset_id, Decimal("0")),
             reverse=True,
         )
+        # A full Cartesian product of all assets is neither usable nor necessary.
+        # Select a target-month pool whose observed monthly depreciation can cover
+        # three times the requested change, retaining at least eight alternatives.
+        straight: list[FixedAsset] = []
+        covered = Decimal("0")
+        required_coverage = max(abs(delta) * Decimal("3"), Decimal("1"))
+        for item in straight_all:
+            straight.append(item)
+            covered += target_monthly_amount.get(item.asset_id, Decimal("0"))
+            if len(straight) >= 8 and covered >= required_coverage:
+                break
+            if len(straight) >= 16:
+                break
         if direction != "decrease" and straight:
             reference = straight[0]
             life = Decimal(str(reference.useful_life_months or 120))
@@ -591,10 +698,16 @@ class DemoState:
                             "amount": str(amount), "in_service_date": f"{in_service.year:04d}-{in_service.month:02d}-01"}]
             candidates.append({"action_key": "new_asset", "actions": [{"label_cn": f"新增资产（参考 {reference.asset_id}）", "template_id": "straight_new_asset", "target_object": reference.asset_id}], "assumptions": assumptions, "affected_object_count": 1})
         if direction != "increase":
-            for asset in straight[:4]:
-                amount = min(asset.original_cost, max(Decimal("1"), abs(delta) * Decimal(str(asset.useful_life_months or 120))))
+            for asset in straight:
+                available_amount = max(
+                    Decimal("0"),
+                    asset.original_cost - asset.accumulated_depreciation - asset.accumulated_impairment,
+                )
+                if available_amount <= 0:
+                    continue
+                amount = available_amount
                 candidates.append({"action_key": f"impair:{asset.asset_id}", "actions": [{"label_cn": f"{asset.asset_id} 减值后重算", "template_id": "straight_impairment", "target_object": asset.asset_id, "notice_cn": "减值为业务假设，需按财务制度确认。"}],
-                                   "assumptions": [{"template_id": "straight_impairment", "asset_id": asset.asset_id, "amount": str(amount), "effective_date": f"{target_period.year:04d}-{target_period.month:02d}-01"}], "affected_object_count": 1})
+                                   "assumptions": [{"template_id": "straight_impairment", "asset_id": asset.asset_id, "amount": str(amount), "effective_date": f"{target_period.year:04d}-{target_period.month:02d}-01"}], "affected_object_count": 1, "tunable_amount_field": "amount"})
         if direction != "decrease":
             for asset in straight[:4]:
                 candidates.append({"action_key": f"accelerate:{asset.asset_id}", "actions": [{"label_cn": f"{asset.asset_id} 加速折旧", "template_id": "straight_accelerated", "target_object": asset.asset_id}],
@@ -676,6 +789,12 @@ class DemoState:
                     method = "年限平均法" if asset.depreciation_code in ("Z111", "Z112") else "产量法" if asset.depreciation_code == "Z802" else "工作量法" if asset.depreciation_code == "Z901" else "折旧规则"
                     rule = next((item for item in recommendation.get("rule_execution_trace", []) if str(item.get("asset_ref") or "") == asset.asset_id), {})
                     branch = str(rule.get("branch_id") or "实际规则分支")
+                    graph_path = self.knowledge_graph_path({
+                        "from": [object_id("FixedAsset", asset.asset_id)],
+                        "to": [object_id("DepreciationPolicy", self._policy_id_for_asset(asset.asset_id, asset.depreciation_code))],
+                        "scenario_id": [str(context.get("scenario_id") or "BASELINE")],
+                    })
+                    graph_narrative = str(graph_path.get("narrative_cn") or "")
                     path_cn = f"{scope} -> 资产 {asset.asset_id} -> 折旧码 {asset.depreciation_code} -> {method} -> {branch} -> 临时假设 {template} -> {context.get('target_period')} 试算结果"
                     nodes = [scope, f"FixedAsset:{asset.asset_id}", f"DepreciationCode:{asset.depreciation_code}", method, branch, f"ScenarioAssumption:{template}", "ForecastLine"]
                 elif template == "production_driver":
@@ -687,8 +806,17 @@ class DemoState:
                 else:
                     path_cn = f"{scope} -> 可作用对象 {target} -> 临时假设 {template} -> {context.get('target_period')} 试算结果"
                     nodes = [scope, target, f"ScenarioAssumption:{template}", "ForecastLine"]
-                paths.append({"recommendation_number": recommendation.get("recommendation_number"), "action_template": template, "path_cn": path_cn, "nodes": nodes, "inferred": True})
+                paths.append({"recommendation_number": recommendation.get("recommendation_number"), "action_template": template, "path_cn": path_cn, "nodes": nodes, "inferred": True, "graph_path": graph_path if asset is not None else None, "graph_narrative_cn": graph_narrative if asset is not None else ""})
         return paths
+
+    def _policy_id_for_asset(self, asset_ref: str, fallback_code: str) -> str:
+        asset_object_id = object_id("FixedAsset", asset_ref)
+        if self.neo4j_store is not None:
+            policy_object_id = self.neo4j_store.policy_object_id_for_asset(asset_object_id)
+            if policy_object_id and ":" in policy_object_id:
+                return policy_object_id.split(":", maxsplit=1)[1]
+        code = next((item for item in self.repository.load_depreciation_codes() if item.code_id == fallback_code), None)
+        return code.policy_id if code else ""
 
     def _decorate_wide_table(self, table: dict[str, object]) -> dict[str, object]:
         catalog = self.wide_table_dimension_catalog()
@@ -1381,13 +1509,13 @@ class DemoState:
     def knowledge_graph(self, query: dict[str, list[str]]) -> dict[str, object]:
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
         focus = self._str_arg(query, "focus", "full")
-        objects = self.business_store.ontology_objects()
-        links = self.business_store.ontology_links()
+        objects, links = self._ontology_graph_records()
         nodes, edges = self._filter_ontology_graph(objects, links, focus)
         policy_matches = [self._policy_match_summary(item, scenario_id) for item in self._asset_source_records()]
         risks = self.business_store.anomalies(scenario_id=scenario_id)
         inferred_count = len([item for item in edges if item.get("inferred")])
         meta = self.business_store.ontology_meta()
+        neo4j_counts = self.neo4j_store.counts() if self.neo4j_store is not None else {}
         return {
             "summary": {
                 "scenario_id": scenario_id,
@@ -1397,14 +1525,22 @@ class DemoState:
                 "object_count": len(objects),
                 "link_count": len(links),
                 "inferred_link_count": inferred_count,
-                "triple_count": self.graph_store.count_triples(),
-                "inferred_triple_count": self.graph_store.count_triples(inferred=True),
+                "triple_count": neo4j_counts.get("link_count", self.graph_store.count_triples()),
+                "inferred_triple_count": neo4j_counts.get("inferred_link_count", self.graph_store.count_triples(inferred=True)),
                 "policy_match_count": len([item for item in policy_matches if item.get("applicable_policy")]),
                 "risk_count": len(risks),
                 "action_count": len(meta["action_types"]),
                 "function_count": len(meta["function_types"]),
+                "graph_database": "Neo4j Community" if self.neo4j_store is not None else "SQLite ontology mirror",
+                "graph_query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQLite",
+                "forecast_record_count": neo4j_counts.get("forecast_record_count", 0),
+                "forecast_summary_count": neo4j_counts.get("forecast_summary_count", 0),
+                "rule_execution_count": neo4j_counts.get("rule_execution_count", 0),
+                "scenario_change_count": neo4j_counts.get("scenario_change_count", 0),
+                "attribution_count": neo4j_counts.get("attribution_count", 0),
             },
             "object_types": meta["object_types"],
+            "link_types": meta["link_types"],
             "nodes": nodes,
             "edges": edges,
             "actions": meta["action_types"],
@@ -1414,7 +1550,9 @@ class DemoState:
             "lineage": {
                 "source_data": "data/customer_snapshot/ 受控客户 Excel",
                 "object_store": str(self.business_db_path),
-                "graph_store": str(self.graph_db_path),
+                "graph_store": "Neo4j Community" if self.neo4j_store is not None else str(self.graph_db_path),
+                "graph_database": "neo4j" if self.neo4j_store is not None else "SQLite ontology mirror",
+                "graph_query_engine": "Cypher / Bolt" if self.neo4j_store is not None else "SQLite",
                 "technical_triples_preview": self.graph_store.triples(limit=80),
             },
         }
@@ -1422,11 +1560,12 @@ class DemoState:
     def knowledge_graph_node(self, query: dict[str, list[str]]) -> dict[str, object]:
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
         node_id = self._str_arg(query, "id", "")
-        node = self.business_store.ontology_node(node_id)
+        node = self.neo4j_store.node(node_id) if self.neo4j_store is not None else self.business_store.ontology_node(node_id)
         if not node:
             return {"node": None, "message_cn": "没有找到该图谱对象。"}
-        adjacent = self.business_store.ontology_adjacent_links(node_id)
-        objects_by_id = {item["object_id"]: item for item in self.business_store.ontology_objects()}
+        adjacent = self.neo4j_store.adjacent_links(node_id) if self.neo4j_store is not None else self.business_store.ontology_adjacent_links(node_id)
+        objects, _links = self._ontology_graph_records()
+        objects_by_id = {item["object_id"]: item for item in objects}
         action_ids = set(default_actions_for(str(node["object_type"])))
         meta = self.business_store.ontology_meta()
         actions = [item for item in meta["action_types"] if item["type_id"] in action_ids]
@@ -1456,8 +1595,8 @@ class DemoState:
         from_id = self._str_arg(query, "from", "")
         to_id = self._str_arg(query, "to", "")
         scenario_id = self._str_arg(query, "scenario_id", "BASELINE")
-        objects = {item["object_id"]: item for item in self.business_store.ontology_objects()}
-        links = self.business_store.ontology_links()
+        object_rows, links = self._ontology_graph_records()
+        objects = {item["object_id"]: item for item in object_rows}
         if from_id not in objects or to_id not in objects:
             return {
                 "scenario_id": scenario_id,
@@ -1467,7 +1606,7 @@ class DemoState:
                 "path_edges": [],
                 "narrative_cn": "没有找到完整路径，请确认起点和终点对象是否存在。",
             }
-        path_edges = self._bfs_path(from_id, to_id, links)
+        path_edges = self.neo4j_store.path(from_id, to_id) if self.neo4j_store is not None else self._bfs_path(from_id, to_id, links)
         path_nodes = []
         if path_edges:
             ids = [from_id]
@@ -1550,7 +1689,7 @@ class DemoState:
                         "parent_id": category.parent_id,
                         "parent_label_cn": category_label(category.parent_id),
                     },
-                    source_system="asset_categories.csv",
+                    source_system="客户资产台账 / 资产相关配置表",
                     technical_ref=category.category_id,
                 )
             )
@@ -1563,7 +1702,7 @@ class DemoState:
                     "继承上级类别",
                     f"{category_label(category.category_id)} 属于 {category_label(category.parent_id)}，可继承上级类别的政策覆盖。",
                     inferred=True,
-                    evidence={"source": "asset_categories.csv", "parent_id": category.parent_id},
+                    evidence={"source": "客户资产相关配置表", "parent_id": category.parent_id},
                 )
 
         for policy in self.repository.load_depreciation_policies():
@@ -1591,7 +1730,7 @@ class DemoState:
                         "start_rule": policy.start_rule,
                         "start_rule_label_cn": start_rule_label(policy.start_rule),
                     },
-                    source_system="depreciation_policies.csv",
+                    source_system="客户资产相关配置表",
                     technical_ref=policy.policy_id,
                 )
             )
@@ -1619,7 +1758,7 @@ class DemoState:
                         "policy_id": code.policy_id,
                         "policy_label_cn": policy_label(code.policy_id),
                     },
-                    source_system="depreciation_codes.csv",
+                    source_system="客户资产相关配置表",
                     technical_ref=code.code_id,
                 )
             )
@@ -1629,7 +1768,7 @@ class DemoState:
                 object_id("DepreciationPolicy", code.policy_id),
                 "折旧码映射政策",
                 f"{depreciation_code_label(code.code_id)} 映射到 {policy_label(code.policy_id)}。",
-                evidence={"source": "depreciation_codes.csv"},
+                evidence={"source": "客户资产相关配置表"},
             )
             policy = next((item for item in self.repository.load_depreciation_policies() if item.policy_id == code.policy_id), None)
             if policy:
@@ -1659,7 +1798,7 @@ class DemoState:
                         "in_service_date": str(asset.in_service_date) if asset.in_service_date else None,
                         "status": asset.status,
                     },
-                    source_system="fixed_assets.csv",
+                    source_system="客户资产明细表",
                     technical_ref=asset.asset_id,
                     metrics=baseline_asset_amounts.get(asset.asset_id, {}),
                 )
@@ -1716,7 +1855,7 @@ class DemoState:
                         "budget_version": asset.budget_version,
                         "status": asset.status,
                     },
-                    source_system="planned_assets.csv",
+                    source_system="当前测算场景假设",
                     technical_ref=asset.planned_asset_id,
                     metrics=baseline_asset_amounts.get(asset.planned_asset_id, {}),
                 )
@@ -1743,7 +1882,7 @@ class DemoState:
                         "budget_version": event.budget_version,
                         "description": event.description,
                     },
-                    source_system="asset_events.csv",
+                    source_system="当前测算场景假设",
                     technical_ref=event.event_id,
                 )
             )
@@ -1865,14 +2004,133 @@ class DemoState:
                     evidence={"rule_id": anomaly.get("rule_id"), "suggestion_cn": anomaly.get("suggestion_cn")},
                 )
 
-        self.business_store.save_ontology_model(
-            object_types=OBJECT_TYPES,
-            link_types=LINK_TYPES,
-            action_types=ACTION_TYPES,
-            function_types=FUNCTION_TYPES,
-            objects=sorted(objects.values(), key=lambda item: item.object_id),
-            links=sorted(links.values(), key=lambda item: item.link_id),
+        ordered_objects = sorted(objects.values(), key=lambda item: item.object_id)
+        active_object_types = {item.object_type for item in ordered_objects}
+        ordered_links = sorted(
+            (
+                item for item in links.values()
+                if item.source_object_id in objects and item.target_object_id in objects
+            ),
+            key=lambda item: item.link_id,
         )
+        active_link_types = {item.link_type for item in ordered_links}
+        active_types = [item for item in OBJECT_TYPES if item.type_id in active_object_types]
+        active_links = [
+            item for item in LINK_TYPES
+            if item.type_id in active_link_types
+            and item.source_type in active_object_types
+            and item.target_type in active_object_types
+        ]
+        active_actions = [
+            item for item in ACTION_TYPES
+            if any(target_type in active_object_types for target_type in item.target_types)
+        ]
+        self.business_store.save_ontology_model(
+            object_types=active_types,
+            link_types=active_links,
+            action_types=active_actions,
+            function_types=FUNCTION_TYPES,
+            objects=ordered_objects,
+            links=ordered_links,
+        )
+        if self.neo4j_store is not None:
+            self.neo4j_store.sync(objects=ordered_objects, links=ordered_links)
+            self.neo4j_store.sync_business_results(
+                forecast_lines=self._neo4j_forecast_projection_rows(),
+                summary_lines=self._neo4j_summary_projection_rows(),
+                rule_executions=self._neo4j_rule_execution_projection_rows(),
+                scenario_changes=self._neo4j_scenario_change_projection_rows(),
+                attributions=self._neo4j_attribution_projection_rows(),
+            )
+
+    def _neo4j_forecast_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for line in self.business_store.forecast_projection_rows():
+            asset_ref = str(line.get("asset_id") or line.get("planned_asset_id") or "")
+            if not asset_ref:
+                continue
+            object_type = "PlannedAsset" if line.get("planned_asset_id") else "FixedAsset"
+            scenario_id = str(line["scenario_id"])
+            period = str(line["period"])
+            rows.append({
+                **line,
+                "record_id": f"{scenario_id}:{asset_ref}:{period}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id(object_type, asset_ref),
+            })
+        return rows
+
+    def _neo4j_summary_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for line in self.business_store.summary_projection_rows():
+            scenario_id = str(line["scenario_id"])
+            summary_id = ":".join(
+                str(line.get(field) or "")
+                for field in (
+                    "scenario_id", "period", "department", "cost_center", "profit_center",
+                    "asset_category", "asset_source_type", "event_type", "depreciation_policy",
+                )
+            )
+            rows.append({
+                **line,
+                "summary_id": summary_id,
+                "scenario_object_id": object_id("Scenario", scenario_id),
+            })
+        return rows
+
+    def _neo4j_rule_execution_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for execution in self.business_store.rule_execution_projection_rows():
+            scenario_id = str(execution["scenario_id"])
+            asset_ref = str(execution["asset_ref"])
+            period = str(execution["period"])
+            raw_inputs = execution.get("inputs")
+            if not isinstance(raw_inputs, dict):
+                try:
+                    raw_inputs = json.loads(str(execution.get("inputs_json") or "{}"))
+                except json.JSONDecodeError:
+                    raw_inputs = {}
+            graph_execution = {
+                key: value
+                for key, value in execution.items()
+                if key not in {"inputs", "inputs_json"}
+            }
+            rows.append({
+                **graph_execution,
+                "execution_id": f"{scenario_id}:{asset_ref}:{period}:{execution['id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id("FixedAsset", asset_ref),
+                "forecast_record_id": f"{scenario_id}:{asset_ref}:{period}",
+                "rule_inputs_json": json.dumps(raw_inputs, ensure_ascii=False),
+            })
+        return rows
+
+    def _neo4j_scenario_change_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for change in self.business_store.scenario_change_projection_rows():
+            scenario_id = str(change["scenario_id"])
+            target_type = str(change.get("target_type") or "FixedAsset")
+            rows.append({
+                **change,
+                "change_record_id": f"{scenario_id}:{change['change_id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "asset_object_id": object_id(target_type, str(change["target_id"])),
+            })
+        return rows
+
+    def _neo4j_attribution_projection_rows(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for attribution in self.business_store.attribution_projection_rows():
+            scenario_id = str(attribution["scenario_id"])
+            object_type = str(attribution.get("object_type") or "FixedAsset")
+            rows.append({
+                **attribution,
+                "attribution_id": f"{scenario_id}:{attribution['period']}:{attribution['object_id']}:{attribution['id']}",
+                "scenario_object_id": object_id("Scenario", scenario_id),
+                "compared_scenario_object_id": object_id("Scenario", str(attribution["compared_to_scenario_id"])),
+                "asset_object_id": object_id(object_type, str(attribution["object_id"])),
+            })
+        return rows
 
     def _put_organization_objects(self, objects: dict[str, ObjectInstance], department: str, cost_center: str, profit_center: str) -> None:
         for object_type, value, label in (
@@ -1947,6 +2205,11 @@ class DemoState:
             sorted(selected_nodes, key=lambda item: (str(item["object_type"]), str(item["id"]))),
             sorted(edges, key=lambda item: str(item["id"])),
         )
+
+    def _ontology_graph_records(self) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        if self.neo4j_store is not None:
+            return self.neo4j_store.objects(), self.neo4j_store.links()
+        return self.business_store.ontology_objects(), self.business_store.ontology_links()
 
     def _graph_node_payload(self, row: dict[str, object]) -> dict[str, object]:
         object_type = str(row["object_type"])
@@ -2385,6 +2648,9 @@ class DemoState:
                 if asset is None:
                     raise ValueError(f"未找到减值目标资产：{target_id}")
                 amount = Decimal(str(assumption.get("amount") or "0"))
+                available_amount = max(Decimal("0"), asset.original_cost - asset.accumulated_depreciation - asset.accumulated_impairment)
+                if amount > available_amount:
+                    raise ValueError(f"减值金额不能超过资产当前可减值金额 {available_amount:.2f}。")
                 effective = parse_date(str(assumption.get("effective_date") or ""))
                 if effective is None:
                     raise ValueError("减值场景需要生效日期。")

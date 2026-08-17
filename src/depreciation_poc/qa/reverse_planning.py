@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -25,6 +26,8 @@ class ReversePlanningTools:
     simulate: Callable[[list[dict[str, Any]], dict[str, Any]], dict[str, Any]]
     ontology_path: Callable[[dict[str, Any]], list[dict[str, Any]]]
     catalog: Callable[..., dict[str, Any]]
+    eligible_asset_refs: Callable[..., list[str]] | None = None
+    graph_read_status: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -149,7 +152,7 @@ class ReversePlanningSkill:
         conversation, is_new = self.conversations.open(_optional_text(payload.get("conversation_id")), scenario_id)
         catalog = self.catalog(scenario_id)
         understanding_context = self._understanding_context(question, scenario_id, catalog, conversation)
-        understanding = self.provider.plan_reverse(understanding_context)
+        understanding = {**self.provider.plan_reverse(understanding_context), "_question": question}
         validation = self._validate_plan(understanding, scenario_id, catalog, conversation)
         if not validation["valid"]:
             clarification = validation["clarification"]
@@ -160,6 +163,7 @@ class ReversePlanningSkill:
         audit_id = f"RP-{uuid.uuid4().hex[:12].upper()}"
         started_at = time.perf_counter()
         execution = self._execute_plan(plan, conversation)
+        self._annotate_trace_source(execution["harness"]["tool_trace"])
         composition_context = {
             "task": "reverse_planning_answer_composition",
             "question": question,
@@ -186,8 +190,10 @@ class ReversePlanningSkill:
             "baseline_amount": execution.get("baseline_amount"),
             "target_amount": execution.get("target_amount"),
             "required_delta": execution.get("required_delta"),
-            "feasible": bool(execution["recommendations"]),
+            "feasible": bool(execution.get("feasible_exact")),
+            "feasibility_cn": execution.get("feasibility_cn"),
             "recommendations": execution["recommendations"],
+            "candidate_evaluation": execution.get("candidate_evaluation", {}),
             "ontology_paths": execution["ontology_paths"],
             "rule_execution_evidence": execution["rule_execution_evidence"],
             "harness": execution["harness"],
@@ -249,6 +255,10 @@ class ReversePlanningSkill:
         target_amount = self._decimal(raw.get("target_amount"), raw.get("target_amount_unit"))
         change_amount = self._decimal(raw.get("target_change_amount"), raw.get("target_change_unit"))
         direction = str(raw.get("direction") or "target")
+        relative_change = self._relative_change_from_question(str(raw.get("_question") or ""))
+        if relative_change is not None:
+            direction, change_amount = relative_change
+            target_amount = None
         if not target_period or target_period not in periods:
             return self._invalid_plan("请提供当前预测期内的目标月份。", catalog)
         if not scope_type or not scope_value or (scope_type, scope_value) not in scopes:
@@ -275,6 +285,19 @@ class ReversePlanningSkill:
                 "confidence": str(raw.get("confidence") or "medium"),
             },
         }
+
+    @staticmethod
+    def _relative_change_from_question(question: str) -> tuple[str, Decimal] | None:
+        """Correct a common model ambiguity: “减少 6 万” is a delta, not a target of 6 万."""
+        compact = question.replace(" ", "")
+        if re.search(r"(?:降至|降到|降低至|降低到|减少至|减少到|下降至|下降到|变为|变成)", compact):
+            return None
+        match = re.search(r"(?:减少|降低|下降|下调|少(?:了)?|增加|提高|上升|上涨)[约近]?(\d+(?:\.\d+)?)\s*(万元|万|元)", compact)
+        if not match:
+            return None
+        amount = Decimal(match.group(1)) * (Decimal("10000") if match.group(2) in ("万", "万元") else Decimal("1"))
+        direction = "decrease" if match.group(0).startswith(("减少", "降低", "下降", "下调", "少")) else "increase"
+        return direction, amount
 
     @staticmethod
     def _infer_recommendation_reference(question: str, conversation: ReverseConversationState) -> dict[str, Any] | None:
@@ -349,8 +372,8 @@ class ReversePlanningSkill:
             self._trace("load_action_templates", {"template_count": len({action.get('template_id') for item in candidates for action in item.get('actions', [])})}),
             self._trace("generate_candidate_actions", {"candidate_count": len(candidates)}),
         ])
-        simulations = self._simulate_candidates(candidates, plan, target)
-        trace.append(self._trace("simulate_rule_actions", {"simulation_count": len(simulations), "scenario_written": False}))
+        simulations, evaluation = self._simulate_candidates(candidates, plan, target)
+        trace.append(self._trace("simulate_rule_actions", {"simulation_count": evaluation["executed_count"], "valid_simulation_count": len(simulations), "scenario_written": False}))
         recommendations = self._select_distinct_recommendations(simulations)
         self._decorate_recommendations(recommendations)
         trace.append(self._trace("rank_distinct_recommendations", {"recommendation_count": len(recommendations)}))
@@ -360,17 +383,34 @@ class ReversePlanningSkill:
             self._trace("get_rule_execution_evidence", {"execution_count": len(rules), "recommendation_count": len(recommendations)}),
             self._trace("trace_reverse_ontology_path", {"path_count": len(paths)}),
         ])
+        feasible_exact = bool(evaluation.get("feasible_exact"))
         return {
             "baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}",
             "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules,
-            "evidence": {"baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}", "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules, "scenario_written": False},
-            "harness": {"tool_trace": trace, "evidence_summary": {"candidate_count": len(candidates), "simulation_count": len(simulations), "recommendation_count": len(recommendations), "scenario_written": False}},
+            "candidate_evaluation": evaluation,
+            "evidence": {"baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}", "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules, "candidate_evaluation": evaluation, "scenario_written": False},
+            "harness": {"tool_trace": trace, "evidence_summary": {"candidate_count": len(candidates), "simulation_count": evaluation["executed_count"], "valid_simulation_count": len(simulations), "recommendation_count": len(recommendations), "feasible_exact": feasible_exact, "scenario_written": False}},
+            "feasible_exact": feasible_exact,
+            "feasibility_cn": str(evaluation.get("feasibility_cn") or ""),
             "template_answer_cn": self._template_answer(plan, baseline, target, recommendations),
         }
 
     @staticmethod
     def _trace(tool_name: str, result_shape: dict[str, Any]) -> dict[str, Any]:
         return {"tool_name": tool_name, "label_cn": ReversePlanningHarness.function_catalog[tool_name], "read_only": True, "result_shape": result_shape}
+
+    def _annotate_trace_source(self, trace: list[dict[str, Any]]) -> None:
+        status = self.tools.graph_read_status() if self.tools.graph_read_status else {"active": False}
+        for item in trace:
+            if item.get("tool_name") in {"list_available_periods", "resolve_target_scope", "read_scope_baseline", "resolve_eligible_objects", "get_rule_execution_evidence", "trace_reverse_ontology_path"}:
+                item["data_source"] = "Neo4j / Cypher" if status.get("active") else "SQLite / SQL fallback"
+                item["query_mode"] = "parameterized_read_only"
+            elif item.get("tool_name") == "simulate_rule_actions":
+                item["data_source"] = "本地折旧规则引擎"
+                item["query_mode"] = "temporary_calculation_no_write"
+            else:
+                item["data_source"] = "Harness deterministic planning"
+                item["query_mode"] = "in_memory_read_only"
 
     def _scope_total(self, plan: dict[str, Any]) -> Decimal:
         filters = {"scenario_id": plan["scenario_id"], "period_from": plan["target_period"], "period_to": plan["target_period"], "limit": 10000}
@@ -381,32 +421,132 @@ class ReversePlanningSkill:
             lines = [row for row in lines if str(row.get("company")) == plan["scope_value"]]
         return sum((Decimal(str(row.get("monthly_depreciation") or "0")) for row in lines), Decimal("0"))
 
-    def _simulate_candidates(self, candidates: list[dict[str, Any]], plan: dict[str, Any], target: Decimal) -> list[dict[str, Any]]:
+    def _simulate_candidates(self, candidates: list[dict[str, Any]], plan: dict[str, Any], target: Decimal) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        for candidate in candidates:
-            simulated = self.tools.simulate(candidate["assumptions"], plan)
-            if Decimal(str(simulated["target_amount"])) == Decimal(str(plan["baseline_amount"] if "baseline_amount" in plan else self._scope_total(plan))):
-                continue
-            results.append({**candidate, **simulated, "gap": Decimal(str(simulated["target_amount"])) - target})
+        rejected: list[dict[str, Any]] = []
+        executed_count = 0
         baseline = Decimal(str(plan["baseline_amount"] if "baseline_amount" in plan else self._scope_total(plan)))
+        for candidate in candidates:
+            try:
+                simulated = self.tools.simulate(candidate["assumptions"], plan)
+                executed_count += 1
+            except (ValueError, ArithmeticError) as exc:
+                rejected.append({"action_key": candidate["action_key"], "reason_cn": f"规则校验未通过：{exc}"})
+                continue
+            candidate_amount = Decimal(str(simulated["target_amount"]))
+            effect = candidate_amount - baseline
+            if abs(effect) <= Decimal("0.01"):
+                rejected.append({"action_key": candidate["action_key"], "reason_cn": "对目标月份折旧没有实际影响。"})
+                continue
+            if plan.get("direction") == "decrease" and effect >= 0:
+                rejected.append({"action_key": candidate["action_key"], "reason_cn": "动作方向与“降低折旧”目标相反。"})
+                continue
+            if plan.get("direction") == "increase" and effect <= 0:
+                rejected.append({"action_key": candidate["action_key"], "reason_cn": "动作方向与“提高折旧”目标相反。"})
+                continue
+            calibrated = self._calibrate_candidate(candidate, plan, baseline, effect)
+            if calibrated is not None:
+                candidate, simulated, candidate_amount, effect = calibrated
+                executed_count += 1
+            results.append({**candidate, **simulated, "gap": candidate_amount - target, "effect": effect})
         influential = sorted(
             results,
             key=lambda row: abs(Decimal(str(row["target_amount"])) - baseline),
             reverse=True,
         )[:6]
-        for left, right in combinations(influential, 2):
-            if left["action_key"] == right["action_key"]:
-                continue
-            left_targets = {(str(action.get("template_id") or ""), str(action.get("target_object") or "")) for action in left["actions"]}
-            right_targets = {(str(action.get("template_id") or ""), str(action.get("target_object") or "")) for action in right["actions"]}
-            if left_targets & right_targets:
-                continue
-            simulated = self.tools.simulate([*left["assumptions"], *right["assumptions"]], plan)
-            gap = Decimal(str(simulated["target_amount"])) - target
-            if abs(gap) >= min(abs(Decimal(str(left["gap"]))), abs(Decimal(str(right["gap"])) )):
-                continue
-            results.append({"action_key": f"{left['action_key']}+{right['action_key']}", "actions": [*left["actions"], *right["actions"]], "assumptions": [*left["assumptions"], *right["assumptions"]], **simulated, "gap": gap, "affected_object_count": left["affected_object_count"] + right["affected_object_count"]})
-        return self._deduplicate_simulations(results)
+        # Single actions rarely hit a material company-level target exactly. Always
+        # test bounded two- and three-action combinations from the most influential
+        # candidates, even when there are already three viable single actions.
+        for size in (2, 3):
+            for combination in combinations(influential, size):
+                action_keys = [str(item["action_key"]) for item in combination]
+                if len(set(action_keys)) != len(action_keys):
+                    continue
+                targets = [
+                    (str(action.get("template_id") or ""), str(action.get("target_object") or ""))
+                    for item in combination for action in item["actions"]
+                ]
+                if len(set(targets)) != len(targets):
+                    continue
+                try:
+                    simulated = self.tools.simulate([assumption for item in combination for assumption in item["assumptions"]], plan)
+                    executed_count += 1
+                except (ValueError, ArithmeticError) as exc:
+                    rejected.append({"action_key": "+".join(action_keys), "reason_cn": f"组合规则校验未通过：{exc}"})
+                    continue
+                candidate_amount = Decimal(str(simulated["target_amount"]))
+                effect = candidate_amount - baseline
+                if abs(effect) <= Decimal("0.01"):
+                    continue
+                if plan.get("direction") == "decrease" and effect >= 0:
+                    continue
+                if plan.get("direction") == "increase" and effect <= 0:
+                    continue
+                results.append({
+                    "action_key": "+".join(action_keys),
+                    "actions": [action for item in combination for action in item["actions"]],
+                    "assumptions": [assumption for item in combination for assumption in item["assumptions"]],
+                    **simulated,
+                    "gap": candidate_amount - target,
+                    "effect": effect,
+                    "affected_object_count": sum(item["affected_object_count"] for item in combination),
+                })
+        unique = self._deduplicate_simulations(results)
+        directional = [
+            row for row in unique
+            if (plan.get("direction") != "decrease" or Decimal(str(row["effect"])) < 0)
+            and (plan.get("direction") != "increase" or Decimal(str(row["effect"])) > 0)
+        ]
+        closest_gap = min((abs(Decimal(str(row["gap"]))) for row in directional), default=None)
+        maximum_change = max((abs(Decimal(str(row["effect"]))) for row in directional), default=Decimal("0"))
+        feasible_exact = closest_gap is not None and closest_gap <= Decimal("0.01")
+        desired_change = abs(Decimal(str(plan.get("required_delta") or "0")))
+        if feasible_exact:
+            feasibility_cn = "在“单方案最多 3 条动作”的约束内，已找到可满足目标金额的规则试算方案。"
+        elif directional:
+            feasibility_cn = (
+                f"在“单方案最多 3 条动作”和当前目标月可作用对象范围内，未找到精确满足目标的方案；"
+                f"已验证的最大同向变化为 {maximum_change:.2f}，目标变化为 {desired_change:.2f}。"
+            )
+        else:
+            feasibility_cn = "当前目标月没有能按目标方向有效改变折旧的已注册规则动作。"
+        return unique, {
+            "generated_count": len(candidates),
+            "executed_count": executed_count,
+            "valid_count": len(unique),
+            "rejected_count": len(rejected),
+            "rejected_examples": rejected[:12],
+            "feasible_exact": feasible_exact,
+            "closest_gap": f"{closest_gap:.2f}" if closest_gap is not None else None,
+            "maximum_directional_change": f"{maximum_change:.2f}",
+            "feasibility_cn": feasibility_cn,
+            "coverage_cn": "已覆盖当前范围内所有可用规则模板；年限平均法资产按目标月实际折旧额筛出足以覆盖目标差额三倍、最多 16 项的候选池。所有单项候选均执行规则试算，再从影响最大的最多 6 项中验证双项和三项组合。可调减值金额会按目标差额校准后复算。",
+        }
+
+    def _calibrate_candidate(
+        self,
+        candidate: dict[str, Any],
+        plan: dict[str, Any],
+        baseline: Decimal,
+        maximum_effect: Decimal,
+    ) -> tuple[dict[str, Any], dict[str, Any], Decimal, Decimal] | None:
+        field = candidate.get("tunable_amount_field")
+        if field != "amount" or len(candidate.get("assumptions", [])) != 1 or maximum_effect == 0:
+            return None
+        desired_effect = abs(Decimal(str(plan.get("required_delta") or "0")))
+        if desired_effect <= 0 or abs(maximum_effect) <= desired_effect:
+            return None
+        original_amount = Decimal(str(candidate["assumptions"][0].get("amount") or "0"))
+        if original_amount <= 0:
+            return None
+        calibrated_amount = (original_amount * desired_effect / abs(maximum_effect)).quantize(Decimal("0.01"))
+        calibrated_candidate = copy.deepcopy(candidate)
+        calibrated_candidate["assumptions"][0][field] = str(calibrated_amount)
+        action = calibrated_candidate["actions"][0]
+        action["label_cn"] = f"{action.get('label_cn')}（建议减值 {calibrated_amount:.2f}）"
+        simulated = self.tools.simulate(calibrated_candidate["assumptions"], plan)
+        amount = Decimal(str(simulated["target_amount"]))
+        return calibrated_candidate, simulated, amount, amount - baseline
 
     @staticmethod
     def _deduplicate_simulations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -430,15 +570,43 @@ class ReversePlanningSkill:
     def _select_distinct_recommendations(self, simulations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         selected: list[dict[str, Any]] = []
         selected_strategies: set[tuple[str, ...]] = set()
-        for row in sorted(simulations, key=lambda row: (abs(Decimal(str(row["gap"]))), len(row["actions"]), row["affected_object_count"])):
+        ordered = sorted(simulations, key=lambda row: (abs(Decimal(str(row["gap"]))), len(row["actions"]), row["affected_object_count"]))
+        selected_action_sets: set[tuple[tuple[str, str], ...]] = set()
+        for row in ordered:
             strategy = self._strategy_signature(row)
             if strategy in selected_strategies:
                 continue
             selected_strategies.add(strategy)
+            action_set = self._action_set(row)
+            selected_action_sets.add(action_set)
             selected.append({**row, "strategy_key": "+".join(strategy), "strategy_label_cn": self._strategy_label(strategy), "selection_label_cn": "最优方案" if not selected else "差异化备选", "selection_reason_cn": "该方案与目标金额的偏差最小。" if not selected else f"保留不同的“{self._strategy_label(strategy)}”规则策略供比较。"})
+            if len(selected) == 3:
+                return selected
+        # Some scopes have only one applicable method. Do not hide viable alternatives
+        # merely because they share a strategy; keep distinct affected-asset combinations.
+        for row in ordered:
+            action_set = self._action_set(row)
+            if action_set in selected_action_sets:
+                continue
+            strategy = self._strategy_signature(row)
+            selected_action_sets.add(action_set)
+            selected.append({
+                **row,
+                "strategy_key": "+".join(strategy),
+                "strategy_label_cn": self._strategy_label(strategy),
+                "selection_label_cn": "同策略资产组合备选",
+                "selection_reason_cn": "当前范围内可行规则策略有限；保留不同受影响资产组合，便于比较目标偏差和业务可执行性。",
+            })
             if len(selected) == 3:
                 break
         return selected
+
+    @staticmethod
+    def _action_set(row: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(
+            (str(action.get("template_id") or ""), str(action.get("target_object") or ""))
+            for action in row.get("actions", [])
+        ))
 
     @staticmethod
     def _decorate_recommendations(recommendations: list[dict[str, Any]]) -> None:
@@ -446,6 +614,23 @@ class ReversePlanningSkill:
             recommendation["recommendation_number"] = index
             recommendation["scenario_written"] = False
             recommendation["assumption_notice_cn"] = "本方案仅为临时业务假设，尚未创建或保存 What-if 场景。"
+            for action in recommendation.get("actions", []):
+                template_id = str(action.get("template_id") or "")
+                target_object = str(action.get("target_object") or "")
+                assumption = next((
+                    item for item in recommendation.get("assumptions", [])
+                    if str(item.get("template_id") or "") == template_id
+                    and str(item.get("asset_id") or item.get("reference_asset_id") or item.get("block_id") or item.get("company") or "") == target_object
+                ), None)
+                if template_id != "straight_impairment" or not assumption:
+                    continue
+                amount = Decimal(str(assumption.get("amount") or "0")).quantize(Decimal("0.01"))
+                effective_date = str(assumption.get("effective_date") or "-")
+                action["recommended_parameters"] = [
+                    {"field": "amount", "label_cn": f"建议减值金额：{amount:,.2f}"},
+                    {"field": "effective_date", "label_cn": f"建议生效月份：{effective_date}"},
+                ]
+                action["recommendation_cn"] = f"建议减值金额：{amount:,.2f}；建议生效月份：{effective_date}"
 
     @staticmethod
     def _template_answer(plan: dict[str, Any], baseline: Decimal, target: Decimal, recommendations: list[dict[str, Any]]) -> str:

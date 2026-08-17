@@ -34,9 +34,25 @@ You can instead copy `.env.example` to `.env` and fill in `DEEPSEEK_API_KEY`. Th
 
 Start the service from the same PowerShell session in which the three `DEEPSEEK_*` variables are set. Check `GET /api/qa/status` after startup: `configured: true` means the wide-table skill will call DeepSeek after its deterministic calculation and Ontology evidence retrieval. The key is intentionally not persisted in source code, SQLite, or browser storage.
 
+## Neo4j Graph Projection
+
+When local Neo4j Community is available, the application projects all business Ontology objects and relations, persisted asset-month calculation records, aggregate records, rule executions, scenario changes, and attribution records into Neo4j. SQLite remains the transactional calculation store during this POC, while the knowledge-graph API reads object relationships and paths from Neo4j using Cypher over Bolt.
+
+Configure the following values in the ignored `.env` file, then restart the service:
+
+```ini
+NEO4J_ENABLED=true
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=<local-password>
+NEO4J_DATABASE=neo4j
+```
+
+Open `http://localhost:7474` to inspect the local graph. The in-app `知识图谱` page displays the active graph engine and projected-record counts so the demo can show the live Neo4j data path.
+
 ## End-to-End Demo
 
-The browser demo rebuilds its ontology triples and business results from the two controlled Excel files on every start. Old scenarios, SQLite results, logs, and graph objects are not retained.
+On first start, the browser demo builds its baseline from the two controlled Excel files. Later starts reopen the persisted baseline and saved What-if scenarios, then refresh their Neo4j graph projection. Replacing the controlled Excel snapshot requires an explicit runtime-data reset before rebuilding the baseline.
 
 ```powershell
 $env:PYTHONPATH="src"
