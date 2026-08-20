@@ -28,6 +28,8 @@ class ReversePlanningTools:
     catalog: Callable[..., dict[str, Any]]
     eligible_asset_refs: Callable[..., list[str]] | None = None
     graph_read_status: Callable[[], dict[str, Any]] | None = None
+    optimize: Callable[[dict[str, Any], Decimal], dict[str, Any]] | None = None
+    evidence_gateway: Callable[[str, str, dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -163,6 +165,7 @@ class ReversePlanningSkill:
         audit_id = f"RP-{uuid.uuid4().hex[:12].upper()}"
         started_at = time.perf_counter()
         execution = self._execute_plan(plan, conversation)
+        self._confirm_ontology_evidence(scenario_id=scenario_id, execution=execution)
         self._annotate_trace_source(execution["harness"]["tool_trace"])
         composition_context = {
             "task": "reverse_planning_answer_composition",
@@ -178,6 +181,7 @@ class ReversePlanningSkill:
         }
         generation = self.provider.compose_reverse(composition_context)
         generation = self._validate_generation(generation, execution)
+        generation = self._append_large_gap_explanation(generation, execution)
         self.conversations.record(conversation, plan=plan, recommendations=execution["recommendations"], audit_id=audit_id, conclusion=str(generation["answer_cn"]))
         result = {
             "audit_id": audit_id,
@@ -192,9 +196,12 @@ class ReversePlanningSkill:
             "required_delta": execution.get("required_delta"),
             "feasible": bool(execution.get("feasible_exact")),
             "feasibility_cn": execution.get("feasibility_cn"),
+            "large_gap_explanation_cn": execution.get("large_gap_explanation_cn"),
             "recommendations": execution["recommendations"],
             "candidate_evaluation": execution.get("candidate_evaluation", {}),
+            "optimization": execution.get("optimization", {}),
             "ontology_paths": execution["ontology_paths"],
+            "ontology_gateway": execution.get("ontology_gateway"),
             "rule_execution_evidence": execution["rule_execution_evidence"],
             "harness": execution["harness"],
             "tool_trace": execution["harness"]["tool_trace"],
@@ -210,6 +217,21 @@ class ReversePlanningSkill:
         }
         self._write_audit_log(audit_id, plan, result, started_at, execution)
         return result
+
+    def _confirm_ontology_evidence(self, *, scenario_id: str, execution: dict[str, Any]) -> None:
+        if self.tools.evidence_gateway is None:
+            raise RuntimeError("反向推演未配置Ontology Evidence Gateway，禁止生成回答。")
+        receipt = self.tools.evidence_gateway(
+            "reverse_planning_answer",
+            scenario_id,
+            dict(execution.get("evidence") or {}),
+            {"recommendations": list(execution.get("recommendations") or [])},
+        )
+        if receipt.get("status") not in {"verified", "missing_after_query"} or receipt.get("query_executed") is not True:
+            raise RuntimeError("反向推演证据未通过Ontology Evidence Gateway确认。")
+        execution["ontology_gateway"] = receipt
+        evidence = execution.setdefault("evidence", {})
+        evidence["ontology_gateway"] = receipt
 
     def _understanding_context(self, question: str, scenario_id: str, catalog: dict[str, Any], conversation: ReverseConversationState) -> dict[str, Any]:
         return {
@@ -366,17 +388,36 @@ class ReversePlanningSkill:
         required_delta = target - baseline
         plan["required_delta"] = required_delta
         trace.append(self._trace("read_scope_baseline", {"baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}"}))
-        candidates = self.tools.candidate_actions(plan)
-        trace.extend([
-            self._trace("resolve_eligible_objects", {"candidate_count": len(candidates)}),
-            self._trace("load_action_templates", {"template_count": len({action.get('template_id') for item in candidates for action in item.get('actions', [])})}),
-            self._trace("generate_candidate_actions", {"candidate_count": len(candidates)}),
-        ])
-        simulations, evaluation = self._simulate_candidates(candidates, plan, target)
-        trace.append(self._trace("simulate_rule_actions", {"simulation_count": evaluation["executed_count"], "valid_simulation_count": len(simulations), "scenario_written": False}))
-        recommendations = self._select_distinct_recommendations(simulations)
-        self._decorate_recommendations(recommendations)
-        trace.append(self._trace("rank_distinct_recommendations", {"recommendation_count": len(recommendations)}))
+        if self.tools.optimize is not None:
+            optimized = self.tools.optimize(plan, baseline)
+            candidates: list[dict[str, Any]] = []
+            recommendations = list(optimized.get("recommendations", []))
+            fallbacks = list(optimized.get("operational_fallback_recommendations", []))
+            for number, item in enumerate([*recommendations, *fallbacks], start=1):
+                item["recommendation_number"] = number
+            recommendations = [*recommendations, *fallbacks]
+            evaluation = dict(optimized.get("candidate_evaluation", {}))
+            optimization = dict(optimized.get("optimization", {}))
+            trace.extend([
+                self._trace("resolve_eligible_objects", {"candidate_count": evaluation.get("generated_count", 0), "selection": "Ontology capability / Cypher"}),
+                self._trace("load_action_templates", {"template_count": len({action.get("template_id") for item in recommendations for action in item.get("actions", [])}), "selection": "Ontology capability / Cypher"}),
+                self._trace("generate_candidate_actions", {"candidate_count": evaluation.get("generated_count", 0), "solver": optimization.get("solver")} ),
+            ])
+            trace.append(self._trace("simulate_rule_actions", {"simulation_count": evaluation.get("executed_count", 0), "valid_simulation_count": evaluation.get("valid_count", 0), "scenario_written": False, "solver": optimization.get("solver")}))
+            trace.append(self._trace("rank_distinct_recommendations", {"recommendation_count": len(recommendations), "solver_status": optimization.get("solver_status")}))
+        else:
+            candidates = self.tools.candidate_actions(plan)
+            trace.extend([
+                self._trace("resolve_eligible_objects", {"candidate_count": len(candidates)}),
+                self._trace("load_action_templates", {"template_count": len({action.get('template_id') for item in candidates for action in item.get('actions', [])})}),
+                self._trace("generate_candidate_actions", {"candidate_count": len(candidates)}),
+            ])
+            simulations, evaluation = self._simulate_candidates(candidates, plan, target)
+            trace.append(self._trace("simulate_rule_actions", {"simulation_count": evaluation["executed_count"], "valid_simulation_count": len(simulations), "scenario_written": False}))
+            recommendations = self._select_distinct_recommendations(simulations)
+            self._decorate_recommendations(recommendations)
+            trace.append(self._trace("rank_distinct_recommendations", {"recommendation_count": len(recommendations)}))
+            optimization = {"solver": "legacy_enumeration_fallback", "is_exact": bool(evaluation.get("feasible_exact"))}
         paths = self.tools.ontology_path({**plan, "recommendations": recommendations})
         rules = [rule for item in recommendations for rule in item.get("rule_execution_trace", [])]
         trace.extend([
@@ -388,8 +429,10 @@ class ReversePlanningSkill:
             "baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}",
             "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules,
             "candidate_evaluation": evaluation,
-            "evidence": {"baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}", "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules, "candidate_evaluation": evaluation, "scenario_written": False},
-            "harness": {"tool_trace": trace, "evidence_summary": {"candidate_count": len(candidates), "simulation_count": evaluation["executed_count"], "valid_simulation_count": len(simulations), "recommendation_count": len(recommendations), "feasible_exact": feasible_exact, "scenario_written": False}},
+            "optimization": optimization,
+            "large_gap_explanation_cn": self._large_gap_explanation(plan, recommendations),
+            "evidence": {"baseline_amount": f"{baseline:.2f}", "target_amount": f"{target:.2f}", "required_delta": f"{required_delta:.2f}", "recommendations": recommendations, "ontology_paths": paths, "rule_execution_evidence": rules, "candidate_evaluation": evaluation, "optimization": optimization, "large_gap_explanation_cn": self._large_gap_explanation(plan, recommendations), "scenario_written": False},
+            "harness": {"tool_trace": trace, "evidence_summary": {"candidate_count": evaluation.get("generated_count", len(candidates)), "simulation_count": evaluation.get("executed_count", 0), "valid_simulation_count": evaluation.get("valid_count", 0), "recommendation_count": len(recommendations), "feasible_exact": feasible_exact, "scenario_written": False}},
             "feasible_exact": feasible_exact,
             "feasibility_cn": str(evaluation.get("feasibility_cn") or ""),
             "template_answer_cn": self._template_answer(plan, baseline, target, recommendations),
@@ -402,9 +445,12 @@ class ReversePlanningSkill:
     def _annotate_trace_source(self, trace: list[dict[str, Any]]) -> None:
         status = self.tools.graph_read_status() if self.tools.graph_read_status else {"active": False}
         for item in trace:
-            if item.get("tool_name") in {"list_available_periods", "resolve_target_scope", "read_scope_baseline", "resolve_eligible_objects", "get_rule_execution_evidence", "trace_reverse_ontology_path"}:
-                item["data_source"] = "Neo4j / Cypher" if status.get("active") else "SQLite / SQL fallback"
+            if item.get("tool_name") in {"list_available_periods", "resolve_target_scope", "read_scope_baseline", "resolve_eligible_objects", "load_action_templates", "get_rule_execution_evidence", "trace_reverse_ontology_path"}:
+                item["data_source"] = "Neo4j / Cypher"
                 item["query_mode"] = "parameterized_read_only"
+            elif item.get("tool_name") == "generate_candidate_actions" and item.get("result_shape", {}).get("solver"):
+                item["data_source"] = "Neo4j / Cypher + OR-Tools"
+                item["query_mode"] = "ontology_constrained_optimization"
             elif item.get("tool_name") == "simulate_rule_actions":
                 item["data_source"] = "本地折旧规则引擎"
                 item["query_mode"] = "temporary_calculation_no_write"
@@ -633,11 +679,46 @@ class ReversePlanningSkill:
                 action["recommendation_cn"] = f"建议减值金额：{amount:,.2f}；建议生效月份：{effective_date}"
 
     @staticmethod
+    def _large_gap_explanation(plan: dict[str, Any], recommendations: list[dict[str, Any]]) -> str | None:
+        requested_delta = abs(Decimal(str(plan.get("required_delta") or "0")))
+        if requested_delta <= Decimal("0"):
+            return None
+        best_gap = min((abs(Decimal(str(item.get("gap") or "0"))) for item in recommendations), default=requested_delta)
+        gap_ratio = best_gap / requested_delta
+        if gap_ratio <= Decimal("0.50"):
+            return None
+        direction = str(plan.get("direction") or "target")
+        if direction == "decrease":
+            remedy = "扩大可经财务确认的减值、减少或停用资产范围，放宽单方案最多 3 项动作的限制，或补充能实际影响目标月折耗/摊销的经营驱动参数。"
+            reason = "当前有效的下降动作受剩余可折旧金额和规则分支边界限制；新增资产、加速折旧等动作方向相反，不能用于降低折旧。"
+        elif direction == "increase":
+            remedy = "补充可在目标月开始计提的新增资产、经审批的加速折旧假设，或补充能实际影响目标月折耗/摊销的经营驱动参数。"
+            reason = "当前可作用对象的目标月响应和规则边界不足以形成所需增量。"
+        else:
+            remedy = "补充可作用资产、允许的会计动作或能实际影响目标月的经营驱动参数后重新求解。"
+            reason = "当前可作用对象和规则边界不足以将折旧调整到指定目标。"
+        return (
+            f"可行性说明：最佳方案与目标仍相差 {best_gap:,.2f}，占本次需要调整金额的 {gap_ratio * Decimal('100'):.1f}%。"
+            f"为什么当前不能达成：{reason}怎样才可能达成：{remedy}"
+        )
+
+    @staticmethod
+    def _append_large_gap_explanation(generation: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any]:
+        explanation = str(execution.get("large_gap_explanation_cn") or "")
+        if not explanation or explanation in str(generation.get("answer_cn") or ""):
+            return generation
+        return {**generation, "answer_cn": f"{str(generation.get('answer_cn') or '').rstrip()}\n\n{explanation}"}
+
+    @staticmethod
     def _template_answer(plan: dict[str, Any], baseline: Decimal, target: Decimal, recommendations: list[dict[str, Any]]) -> str:
         if not recommendations:
-            return f"{plan['scope_value']} 在 {plan['target_period']} 的基准折旧为 {baseline:.2f}，目标为 {target:.2f}。当前已注册规则动作未找到可有效改变该目标期结果的方案。"
+            base = f"{plan['scope_value']} 在 {plan['target_period']} 的基准折旧为 {baseline:.2f}，目标为 {target:.2f}。当前已注册规则动作未找到可有效改变该目标期结果的方案。"
+            explanation = ReversePlanningSkill._large_gap_explanation(plan, recommendations)
+            return f"{base}\n\n{explanation}" if explanation else base
         details = "；".join(f"方案 {item['recommendation_number']}（{item['strategy_label_cn']}）：试算 {Decimal(str(item['target_amount'])):.2f}，目标偏差 {Decimal(str(item['gap'])):.2f}" for item in recommendations)
-        return f"{plan['scope_value']} 在 {plan['target_period']} 的基准折旧为 {baseline:.2f}，目标为 {target:.2f}。{details}。所有推荐均为临时业务假设，未创建或保存 What-if 场景；减值等假设需按财务制度确认。"
+        base = f"{plan['scope_value']} 在 {plan['target_period']} 的基准折旧为 {baseline:.2f}，目标为 {target:.2f}。{details}。所有推荐均为临时业务假设，未创建或保存 What-if 场景；减值等假设需按财务制度确认。"
+        explanation = ReversePlanningSkill._large_gap_explanation(plan, recommendations)
+        return f"{base}\n\n{explanation}" if explanation else base
 
     @staticmethod
     def _explain_template(plan: dict[str, Any], recommendations: list[dict[str, Any]]) -> str:

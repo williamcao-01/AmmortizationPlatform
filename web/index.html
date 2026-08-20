@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>资产折旧预算工作台</title>
-    <link rel="stylesheet" href="/styles.css?v=20260817-business-polish-3">
+    <link rel="stylesheet" href="/styles.css?v=20260819-wide-table-fix">
   </head>
   <body>
     <aside class="sidebar">
@@ -16,6 +16,7 @@
         <button class="nav-item active" data-view="overview" type="button">总览</button>
         <button class="nav-item" data-view="assets" type="button">资产工作台</button>
         <button class="nav-item" data-view="graph" type="button">知识图谱</button>
+        <button class="nav-item" data-view="chat" type="button">知识问答</button>
         <button class="nav-item" data-view="wide" type="button">折旧宽表</button>
         <button class="nav-item" data-view="whatif" type="button">What-if 测算</button>
         <button class="nav-item" data-view="reverse" type="button">反向推演</button>
@@ -189,6 +190,29 @@
             </aside>
           </div>
         </section>
+      </section>
+
+      <section id="chat" class="view knowledge-chat-view">
+        <div class="knowledge-chat-shell">
+          <aside class="chat-thread-rail" aria-label="问答会话">
+            <div class="chat-thread-head">
+              <strong>会话</strong>
+              <button id="knowledgeChatNewBtn" class="chat-icon-button" type="button" aria-label="新建会话" title="新建会话">+</button>
+            </div>
+            <div id="knowledgeChatThreads" class="chat-thread-list"></div>
+            <div id="knowledgeChatStatus" class="chat-provider-status" aria-live="polite"></div>
+          </aside>
+          <section class="chat-conversation" aria-label="知识问答对话">
+            <div id="knowledgeChatMessages" class="chat-message-list" aria-live="polite"></div>
+            <div class="chat-composer-wrap">
+              <div class="chat-composer">
+                <textarea id="knowledgeChatInput" rows="1" placeholder="询问资产、折旧数据、计算规则或Ontology关系" aria-label="输入知识问题"></textarea>
+                <button id="knowledgeChatSendBtn" class="chat-send-button" type="button" aria-label="发送" title="发送">↑</button>
+              </div>
+              <div class="chat-composer-meta"><span id="knowledgeChatContext">BASELINE</span><span>Enter 发送 · Shift+Enter 换行</span></div>
+            </div>
+          </section>
+        </div>
       </section>
 
       <section id="wide" class="view">
@@ -373,6 +397,6 @@
       <div id="assetDrawerBody" class="asset-drawer-body"></div>
     </aside>
 
-    <script src="/app.js?v=20260817-business-polish"></script>
+    <script src="/app.js?v=20260819-wide-table-fix"></script>
   </body>
 </html>

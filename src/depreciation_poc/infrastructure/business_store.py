@@ -77,14 +77,23 @@ class BusinessResultStore:
 
     def reset(self) -> None:
         with self._lock:
+            self.reset_business_data()
             for table in (
-                "ontology_links",
-                "ontology_objects",
                 "function_types",
                 "action_types",
                 "link_types",
                 "property_types",
                 "object_types",
+            ):
+                self.connection.execute(f"delete from {table}")
+            self.connection.commit()
+
+    def reset_business_data(self) -> None:
+        """Clear imported instances and results while retaining ontology metadata tables."""
+        with self._lock:
+            for table in (
+                "ontology_links",
+                "ontology_objects",
                 "attribution_lines",
                 "rule_executions",
                 "scenario_assumptions",
@@ -95,6 +104,16 @@ class BusinessResultStore:
                 "forecast_lines",
                 "anomalies",
                 "scenarios",
+            ):
+                self.connection.execute(f"delete from {table}")
+            self.connection.commit()
+
+    def clear_ontology_data(self) -> None:
+        """Remove legacy Ontology metadata and instances from the calculation SQLite database."""
+        with self._lock:
+            for table in (
+                "ontology_links", "ontology_objects", "function_types", "action_types",
+                "link_types", "property_types", "object_types",
             ):
                 self.connection.execute(f"delete from {table}")
             self.connection.commit()
@@ -347,6 +366,53 @@ class BusinessResultStore:
     def scenario_assumptions(self, scenario_id: str) -> list[dict[str, Any]]:
         rows = self._all("select payload_json from scenario_assumptions where scenario_id = ? order by assumption_id", (scenario_id,))
         return [json.loads(row["payload_json"]) for row in rows]
+
+    def save_chat_action_draft(
+        self,
+        *,
+        draft_id: str,
+        conversation_id: str,
+        action_type: str,
+        base_scenario_id: str,
+        original_instruction: str,
+        payload: dict[str, Any],
+        preview: dict[str, Any],
+        ontology_gateway: dict[str, Any],
+        expires_at: str,
+    ) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            self.connection.execute(
+                """insert into chat_action_drafts(
+                     draft_id, conversation_id, action_type, status, base_scenario_id,
+                     original_instruction, payload_json, preview_json, ontology_gateway_json,
+                     created_at, expires_at, confirmed_at, scenario_id
+                   ) values (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, null, null)""",
+                (draft_id, conversation_id, action_type, base_scenario_id, original_instruction,
+                 json.dumps(payload, ensure_ascii=False), json.dumps(preview, ensure_ascii=False),
+                 json.dumps(ontology_gateway, ensure_ascii=False), now, expires_at),
+            )
+            self.connection.commit()
+
+    def chat_action_draft(self, draft_id: str) -> dict[str, Any] | None:
+        row = self._one("select * from chat_action_drafts where draft_id = ?", (draft_id,))
+        if row is None:
+            return None
+        row = dict(row)
+        for key in ("payload_json", "preview_json", "ontology_gateway_json"):
+            row[key.removesuffix("_json")] = json.loads(row.pop(key) or "{}")
+        return row
+
+    def update_chat_action_draft(self, draft_id: str, *, status: str, scenario_id: str | None = None) -> None:
+        confirmed_at = datetime.now().isoformat(timespec="seconds") if status == "CONFIRMED" else None
+        with self._lock:
+            self.connection.execute(
+                """update chat_action_drafts
+                   set status = ?, confirmed_at = coalesce(?, confirmed_at), scenario_id = coalesce(?, scenario_id)
+                   where draft_id = ?""",
+                (status, confirmed_at, scenario_id, draft_id),
+            )
+            self.connection.commit()
 
     def save_rule_executions(self, *, scenario_id: str, executions: list[RuleExecution]) -> None:
         with self._lock:
@@ -1284,6 +1350,23 @@ class BusinessResultStore:
                   payload_json text not null,
                   primary key(scenario_id, assumption_id)
                 );
+
+                create table if not exists chat_action_drafts (
+                  draft_id text primary key,
+                  conversation_id text not null,
+                  action_type text not null,
+                  status text not null,
+                  base_scenario_id text not null,
+                  original_instruction text not null,
+                  payload_json text not null,
+                  preview_json text not null,
+                  ontology_gateway_json text not null,
+                  created_at text not null,
+                  expires_at text not null,
+                  confirmed_at text,
+                  scenario_id text
+                );
+                create index if not exists idx_chat_action_drafts_status on chat_action_drafts(status, expires_at);
 
                 create table if not exists object_types (
                   type_id text primary key,

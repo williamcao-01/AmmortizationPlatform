@@ -285,7 +285,7 @@ const detailColumns = [
   ["opening_original_cost", "期初原值", 16, moneyFormat], ["opening_accumulated_depreciation", "期初累计折旧", 16, moneyFormat], ["opening_accumulated_impairment", "期初累计减值", 16, moneyFormat], ["opening_net_value", "期初净值", 16, moneyFormat],
   ["addition_amount", "新增", 14, moneyFormat], ["disposal_amount", "减少", 14, moneyFormat], ["impairment_amount", "减值", 14, moneyFormat], ["depreciable_base", "可折旧基数", 16, moneyFormat], ["monthly_depreciation", "月折旧", 16, moneyFormat],
   ["accumulated_depreciation", "累计折旧", 16, moneyFormat], ["closing_net_value", "期末净值", 16, moneyFormat], ["validation_status", "状态", 12], ["formula_cn", "公式", 36], ["conclusion_cn", "规则结论", 30],
-  ["remaining_depreciable_amount", "规则输入：剩余可折旧金额", 20, moneyFormat], ["remaining_months", "规则输入：剩余月数", 16, '#,##0.00'], ["rule_opening_net_value", "规则输入：期初净值", 18, moneyFormat], ["production_rate", "规则输入：折耗率", 16, percentFormat],
+  ["remaining_depreciable_amount", "规则输入：剩余可折旧金额", 20, moneyFormat], ["remaining_months", "规则输入：剩余月数", 16, '#,##0.00'], ["rule_opening_net_value", "规则输入：期初账面净额", 18, moneyFormat], ["production_rate", "规则输入：折耗率", 16, percentFormat],
   ["workload_total_amortization", "规则输入：总摊销额", 18, moneyFormat], ["workload_asset_opening_net", "规则输入：资产期初净值", 18, moneyFormat], ["workload_pool_opening_net", "规则输入：资产池期初净额", 20, moneyFormat], ["source_event_id", "来源事件", 18],
 ];
 writeTable(detail, 0, detailColumns.map(([key, label, width, format]) => ({ key, label, width, format })), data.detail_rows, "ForecastDetailTable");
@@ -307,7 +307,7 @@ source.freezePanes.freezeColumns(3);
 // Driver parameters
 writeTable(drivers, 0, [
   { key: "driver_type", label: "驱动类型", width: 16 }, { key: "period", label: "预测月份", width: 13 }, { key: "company", label: "公司", width: 12 },
-  { key: "target_id", label: "区块/公司", width: 16 }, { key: "production", label: "产量", width: 14, format: '#,##0.0000' }, { key: "reserves", label: "剩余储量", width: 14, format: '#,##0.0000' },
+  { key: "target_id", label: "区块/所属单位", width: 18 }, { key: "production", label: "当期产量", width: 14, format: '#,##0.0000' }, { key: "reserves", label: "当期总储量", width: 14, format: '#,##0.0000' },
   { key: "workload", label: "工作量", width: 14, format: '#,##0.0000' }, { key: "unit_fee", label: "单位费用", width: 14, format: moneyFormat }, { key: "assumption_note", label: "基准假设", width: 48 }, { key: "source_refs", label: "来源定位", width: 52 },
 ], data.drivers, "DriversTable");
 drivers.freezePanes.freezeRows(1);

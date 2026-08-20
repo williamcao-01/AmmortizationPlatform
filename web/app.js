@@ -21,6 +21,13 @@ const state = {
   scenarioDraftAssumptions: [],
   reverseCatalog: null,
   snapshotStatus: null,
+  knowledgeChatThreads: [],
+  knowledgeChatActiveId: null,
+  knowledgeChatLoaded: false,
+  knowledgeChatPending: false,
+  knowledgeChatAbortController: null,
+  knowledgeChatStatus: null,
+  knowledgeChatBackendReady: false,
 };
 
 const labels = {
@@ -46,7 +53,6 @@ const labels = {
   asset_category: "资产类别",
   depreciation_code: "折旧码",
   depreciation_policy: "政策",
-  annual_total: "期间合计",
   scenario_id: "当前场景",
   first_depreciation_period: "首次计提月份",
   monthly_depreciation_at_start: "起始月折旧",
@@ -67,7 +73,7 @@ const policyDisplay = (value) => value || "-";
 const categoryDisplay = (value) => categoryLabels[value] || value || "-";
 
 const ruleBranchDisplay = (value) => ({
-  CONFIGURED_DEPLETION_RATE: "按区块配置折耗率计提",
+  NORMAL_PRODUCTION: "按产量/总储量计算折耗",
   LIFE_EXPIRED: "折旧到期，停止计提",
   STRAIGHT_LINE: "年限平均法计提",
   IMPAIRMENT_RECALC: "减值后重算",
@@ -79,6 +85,8 @@ const money = (value) => Number(value || 0).toLocaleString("zh-CN", {
   minimumFractionDigits: 2,
   maximumFractionDigits: 2,
 });
+
+const multiline = (value) => escapeHtml(value || "").replace(/\n/g, "<br>");
 
 const compactMoney = (value) => Number(value || 0).toLocaleString("zh-CN", {
   notation: "compact",
@@ -402,15 +410,18 @@ const renderAnnualTrend = (rows) => {
       <text x="${left - 10}" y="${y + 4}" class="axis-label" text-anchor="end">${escapeHtml(compactMoney(value))}</text>
     `;
   }).join("");
-  const markers = points.map((point) => `
+  const xAxisLabelStep = Math.max(1, Math.ceil((points.length - 1) / 7));
+  const markers = points.map((point, index) => `
     <g class="line-point">
       <circle cx="${point.x}" cy="${point.y}" r="5"></circle>
-      <text x="${point.x}" y="${height - 18}" text-anchor="middle">${escapeHtml(point.period || point.year)}</text>
+      ${(index === 0 || index === points.length - 1 || index % xAxisLabelStep === 0)
+        ? `<text x="${point.x}" y="${height - 18}" text-anchor="middle">${escapeHtml(point.period || point.year)}</text>`
+        : ""}
       <title>${escapeHtml(point.period || point.year)}：${money(point.depreciation)}</title>
     </g>
   `).join("");
   container.innerHTML = `
-    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="年度折旧趋势折线图">
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="月度折旧趋势折线图">
       ${grid}
       <line x1="${left}" y1="${top}" x2="${left}" y2="${height - bottom}" class="axis-line"></line>
       <line x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}" class="axis-line"></line>
@@ -838,7 +849,7 @@ const renderReversePlanningResult = (result) => {
   }
   const analysis = result.question_analysis || {};
   const recommendations = asArray(result.recommendations);
-  const cards = recommendations.map((plan, index) => {
+  const renderCards = (plans) => plans.map((plan, index) => {
     const actions = asArray(plan.actions).map((action) => {
       const parameters = asArray(action.recommended_parameters);
       const parameterText = action.recommendation_cn || parameters.map((item) => item.label_cn).filter(Boolean).join("；");
@@ -846,13 +857,15 @@ const renderReversePlanningResult = (result) => {
     }).join("");
     const rules = asArray(plan.rule_execution_trace).slice(0, 8).map((rule) => `<li>${escapeHtml(`${rule.asset_ref} · ${rule.branch_id} · ${rule.conclusion_cn}`)}</li>`).join("");
     return `<article class="reverse-plan-card">
-      <div class="reverse-plan-head"><span>方案 ${index + 1} · ${escapeHtml(plan.selection_label_cn || "推荐方案")}</span><strong>目标偏差 ${money(plan.gap)}</strong></div>
+      <div class="reverse-plan-head"><span>方案 ${escapeHtml(plan.recommendation_number || index + 1)} · ${escapeHtml(plan.selection_label_cn || "推荐方案")}</span><strong>目标偏差 ${money(plan.gap)}</strong></div>
       <dl><dt>试算结果</dt><dd>${money(plan.target_amount)}</dd><dt>影响对象</dt><dd>${escapeHtml(plan.affected_object_count)}</dd></dl>
       <p class="reverse-plan-reason">策略：${escapeHtml(plan.strategy_label_cn || "-")}。${escapeHtml(plan.selection_reason_cn || "")}</p>
       <h3>建议动作</h3><ul>${actions}</ul>
-      <details><summary>规则执行证据</summary><ul>${rules || "<li>当前方案未返回明细证据</li>"}</ul></details>
+      <details><summary>引擎复算证据</summary><ul>${rules || "<li>当前方案已通过目标月规则复算。</li>"}</ul></details>
     </article>`;
   }).join("");
+  const accountingPlans = recommendations.filter((item) => item.solution_kind !== "operational_fallback");
+  const operationalPlans = recommendations.filter((item) => item.solution_kind === "operational_fallback");
   const paths = asArray(result.ontology_paths).map((path) => `<li><strong>方案 ${escapeHtml(path.recommendation_number || "-")}</strong><span>${escapeHtml(path.path_cn || "")}</span></li>`).join("");
   const mode = result.qa_skill?.used_llm ? `实时大模型 · ${result.qa_skill.model || "DeepSeek"}` : "确定性规则结论";
   const plan = result.question_plan || {};
@@ -865,12 +878,15 @@ const renderReversePlanningResult = (result) => {
   }).join("");
   const executionSummary = result.harness?.evidence_summary || {};
   const evaluation = result.candidate_evaluation || {};
+  const optimization = result.optimization || {};
   el("reversePlanningResult").innerHTML = `
     <section class="skill-status ${result.qa_skill?.used_llm ? "llm" : "fallback"}"><div><span>反向推演 Agent</span><strong>${escapeHtml(result.qa_skill?.skill_name || "reverse_depreciation_planning")}</strong></div><div><span>本次执行状态</span><strong>${escapeHtml(mode)}</strong></div><p>审计编号：${escapeHtml(result.audit_id || "-")}。本次执行 ${escapeHtml(executionSummary.simulation_count ?? 0)} 次临时规则试算；没有创建或保存 What-if 场景。</p></section>
     <section><h3>问题理解</h3><div class="analysis-grid"><div><span>问题类型</span><strong>${escapeHtml(analysis.intent_label_cn || "-")}</strong></div><div><span>目标范围</span><strong>${escapeHtml(analysis.scope_value || "-")}</strong></div><div><span>目标月份</span><strong>${escapeHtml(analysis.target_period || "-")}</strong></div><div><span>目标方向</span><strong>${escapeHtml(analysis.direction || "-")}</strong></div><div><span>置信度</span><strong>${escapeHtml(plan.confidence || analysis.confidence || "-")}</strong></div></div><div class="model-call-grid">${callCards}</div></section>
-    <section><h3>目标与规则试算</h3><div class="reverse-target-summary"><div><span>基准折旧</span><strong>${money(result.baseline_amount)}</strong></div><div><span>目标折旧</span><strong>${money(result.target_amount)}</strong></div><div><span>需要变化</span><strong>${money(result.required_delta)}</strong></div><div><span>场景写入</span><strong>未写入</strong></div></div><p class="reverse-feasibility ${result.feasible ? "verified" : "limited"}">${escapeHtml(result.feasibility_cn || "正在核验目标可行性。")}</p><p class="reverse-evaluation">${escapeHtml(evaluation.coverage_cn || "候选动作正在按规则引擎试算。 ")} 已生成 ${escapeHtml(evaluation.generated_count ?? executionSummary.candidate_count ?? 0)} 项候选，执行 ${escapeHtml(evaluation.executed_count ?? executionSummary.simulation_count ?? 0)} 次试算，保留 ${escapeHtml(evaluation.valid_count ?? executionSummary.valid_simulation_count ?? 0)} 个有效结果，淘汰 ${escapeHtml(evaluation.rejected_count ?? 0)} 个无效结果。</p><ul class="tool-trace">${tools}</ul></section>
+    <section><h3>目标与优化求解</h3><div class="reverse-target-summary"><div><span>基准折旧</span><strong>${money(result.baseline_amount)}</strong></div><div><span>目标折旧</span><strong>${money(result.target_amount)}</strong></div><div><span>需要变化</span><strong>${money(result.required_delta)}</strong></div><div><span>场景写入</span><strong>未写入</strong></div></div><p class="reverse-feasibility ${result.feasible ? "verified" : "limited"}">${escapeHtml(result.feasibility_cn || "正在核验目标可行性。")}</p><p class="reverse-evaluation">${escapeHtml(optimization.coverage_cn || evaluation.coverage_cn || "候选动作正在按规则引擎试算。 ")} 求解器：${escapeHtml(optimization.solver || "-")}；状态：${escapeHtml(optimization.solver_status || "-")}；用时 ${escapeHtml(optimization.elapsed_ms ?? "-")} ms。已生成 ${escapeHtml(evaluation.generated_count ?? executionSummary.candidate_count ?? 0)} 项候选，执行 ${escapeHtml(evaluation.executed_count ?? executionSummary.simulation_count ?? 0)} 次试算，保留 ${escapeHtml(evaluation.valid_count ?? executionSummary.valid_simulation_count ?? 0)} 个有效结果。</p><ul class="tool-trace">${tools}</ul></section>
     <section class="reverse-path"><h3>Ontology 推演</h3><ul class="ontology-path-list">${paths || "<li><span>当前问题没有可展开的 Ontology 路径。</span></li>"}</ul></section>
-    <section><h3>推荐结论</h3><div class="answer-card"><span>建议结论</span><p>${escapeHtml(result.answer_cn || "暂无建议")}</p><small>审计编号：${escapeHtml(result.audit_id || "-")} · ${escapeHtml(result.answer_validation?.reason_cn || "")}</small></div><div class="reverse-plan-grid">${cards || "<p class=\"empty-note\">当前范围没有可有效改变目标期折旧的规则动作。</p>"}</div></section>
+    <section><h3>推荐结论</h3><div class="answer-card"><span>建议结论</span><p>${multiline(result.answer_cn || "暂无建议")}</p><small>审计编号：${escapeHtml(result.audit_id || "-")} · ${escapeHtml(result.answer_validation?.reason_cn || "")}</small></div></section>
+    <section><h3>会计类主建议</h3><div class="reverse-plan-grid">${renderCards(accountingPlans) || "<p class=\"empty-note\">当前会计类动作无法有效改变目标期折旧。</p>"}</div></section>
+    ${operationalPlans.length ? `<section><h3>经营驱动备选</h3><p class="reverse-evaluation">以下方案仅作为经营假设展示，因为会计类动作未能精确达标；不代表已发生事实。</p><div class="reverse-plan-grid">${renderCards(operationalPlans)}</div></section>` : ""}
   `;
 };
 
@@ -1008,7 +1024,6 @@ const renderWideTable = (data) => {
     <tr>
       <th class="sticky-col sticky-1">层级</th>
       <th class="sticky-col sticky-2">分析对象</th>
-      <th class="sticky-col sticky-3">期间合计</th>
       ${data.periods.map((period) => {
         const meta = data.period_metadata?.[period];
         return `<th class="month-head">${escapeHtml(period)}${meta ? `<small>${escapeHtml(meta.label_cn)}</small>` : ""}</th>`;
@@ -1020,15 +1035,16 @@ const renderWideTable = (data) => {
       <td class="sticky-col sticky-1">${escapeHtml(node.dimension_label_cn || node.dimension)}</td>
       <td class="wide-node sticky-col sticky-2" style="--node-depth:${Number(node.depth || 0)}">
         ${(node.children || []).length ? `<button class="tree-toggle" type="button" data-tree-id="${escapeHtml(node.id)}" aria-label="展开或收起">${state.wideExpanded.has(node.id) ? "−" : "+"}</button>` : "<span class=\"tree-leaf\"></span>"}
-        ${node.dimension === "asset" ? `<button class="link-button" type="button" data-policy-ref="${escapeHtml(node.value)}">${escapeHtml(node.label_cn)}</button>` : escapeHtml(node.label_cn)}
+        ${node.dimension === "asset"
+          ? `<button class="link-button wide-node-label" type="button" data-policy-ref="${escapeHtml(node.value)}" title="${escapeHtml(node.label_cn)}">${escapeHtml(node.label_cn)}</button>`
+          : `<span class="wide-node-label" title="${escapeHtml(node.label_cn)}">${escapeHtml(node.label_cn)}</span>`}
       </td>
-      <td class="amount total-cell sticky-col sticky-3">${money(node.annual_total)}</td>
       ${data.periods.map((period) => {
         const amount = Number(node.months?.[period] || 0);
         return `<td class="amount ${amount === 0 ? "zero" : ""}">${amount === 0 ? "-" : money(amount)}</td>`;
       }).join("")}
     </tr>
-  `).join("") || `<tr><td colspan="${data.periods.length + 3}">没有符合条件的数据</td></tr>`;
+  `).join("") || `<tr><td colspan="${data.periods.length + 2}">没有符合条件的数据</td></tr>`;
   el("wideTableBody").querySelectorAll("[data-tree-id]").forEach((button) => {
     button.addEventListener("click", () => {
       const id = button.dataset.treeId;
@@ -1259,7 +1275,7 @@ const renderScenarioDynamicFields = () => {
       `<div class="scenario-readonly-target"><b>${escapeHtml(driver.target_label_cn || `区块 ${driver.target_id}`)}</b><span class="scenario-field-hint">目标区块由资产台账自动带入，不可修改。</span></div>`,
       periodSelect,
       scenarioField("scenarioProduction", "区块产量", { min: "0", step: "0.0001", hint: `基准 ${baseline.production ?? "-"}；留空表示保持基准。` }),
-      scenarioField("scenarioReserves", "剩余储量", { min: "0", step: "0.0001", hint: `基准 ${baseline.reserves ?? "-"}；留空表示保持基准。` }),
+      scenarioField("scenarioReserves", "当期总储量", { min: "0", step: "0.0001", hint: `基准 ${baseline.reserves ?? "-"}；留空表示保持基准。` }),
     ].join("");
   } else if (template.id === "workload_driver") {
     if (!driver.target_id) {
@@ -1269,9 +1285,8 @@ const renderScenarioDynamicFields = () => {
     container.innerHTML = [
       `<div class="scenario-readonly-target"><b>${escapeHtml(driver.target_label_cn || driver.target_id)}</b><span class="scenario-field-hint">分摊对象由资产台账自动带入，不可修改。</span></div>`,
       periodSelect,
-      scenarioField("scenarioWorkload", "工作量", { min: "0", step: "0.0001", hint: `基准 ${baseline.workload ?? "-"}；留空表示保持基准。` }),
-      scenarioField("scenarioUnitFee", "单位费用", { min: "0", step: "0.0001", hint: `基准 ${baseline.unit_fee ?? "-"}；留空表示保持基准。` }),
-      scenarioField("scenarioTotalAmortization", "当月总摊销额", { min: "0", step: "0.01", hint: `基准 ${baseline.total_amortization || "-"}；填写后优先采用该金额。`, wide: true }),
+      scenarioField("scenarioTotalAmortization", "当月总摊销额", { min: "0", step: "0.01", hint: `基准 ${baseline.total_amortization || "-"}；留空表示保持基准。` }),
+      scenarioField("scenarioPoolOpeningNet", "资产池期初净额", { min: "0", step: "0.01", hint: `基准 ${baseline.pool_opening_net_value || "-"}；留空表示保持基准。` }),
     ].join("");
   } else {
     container.innerHTML = `<p class="empty-note">当前规则模板尚未配置输入项。</p>`;
@@ -1360,7 +1375,7 @@ const buildScenarioAssumption = () => {
   } else if (templateId === "production_driver") {
     const driver = detail.driver_context || {};
     if (!driver.target_id || !period) throw new Error("该产量法资产缺少区块或生效月份，无法建立假设。");
-    if (value("scenarioProduction") === "" && value("scenarioReserves") === "") throw new Error("请至少填写区块产量或剩余储量中的一项。");
+    if (value("scenarioProduction") === "" && value("scenarioReserves") === "") throw new Error("请至少填写区块产量或当期总储量中的一项。");
     Object.assign(assumption, {
       block_id: driver.target_id, company: asset.company, period,
       ...(value("scenarioProduction") !== "" ? { production: value("scenarioProduction") } : {}),
@@ -1369,14 +1384,13 @@ const buildScenarioAssumption = () => {
   } else if (templateId === "workload_driver") {
     const driver = detail.driver_context || {};
     if (!driver.target_id || !period) throw new Error("该工作量法资产缺少分摊对象或生效月份，无法建立假设。");
-    if (["scenarioWorkload", "scenarioUnitFee", "scenarioTotalAmortization"].every((id) => value(id) === "")) {
-      throw new Error("请至少填写工作量、单位费用或当月总摊销额中的一项。");
+    if (["scenarioTotalAmortization", "scenarioPoolOpeningNet"].every((id) => value(id) === "")) {
+      throw new Error("请至少填写当月总摊销额或资产池期初净额中的一项。");
     }
     Object.assign(assumption, {
       company: driver.target_id, period,
-      ...(value("scenarioWorkload") !== "" ? { workload: value("scenarioWorkload") } : {}),
-      ...(value("scenarioUnitFee") !== "" ? { unit_fee: value("scenarioUnitFee") } : {}),
       ...(value("scenarioTotalAmortization") !== "" ? { total_amortization: value("scenarioTotalAmortization") } : {}),
+      ...(value("scenarioPoolOpeningNet") !== "" ? { pool_opening_net_value: value("scenarioPoolOpeningNet") } : {}),
     });
   }
   return assumption;
@@ -1397,10 +1411,11 @@ const scenarioAssumptionSummary = (assumption) => {
   if (assumption.period) pairs.push(`生效月份 ${assumption.period}`);
   if (assumption.amount !== undefined) pairs.push(`${assumption.template_id === "straight_impairment" ? "减值金额" : "金额"} ${money(assumption.amount)}`);
   if (assumption.production !== undefined) pairs.push(`产量 ${assumption.production}`);
-  if (assumption.reserves !== undefined) pairs.push(`剩余储量 ${assumption.reserves}`);
+  if (assumption.reserves !== undefined) pairs.push(`当期总储量 ${assumption.reserves}`);
   if (assumption.workload !== undefined) pairs.push(`工作量 ${assumption.workload}`);
   if (assumption.unit_fee !== undefined) pairs.push(`单位费用 ${assumption.unit_fee}`);
   if (assumption.total_amortization !== undefined) pairs.push(`总摊销额 ${money(assumption.total_amortization)}`);
+  if (assumption.pool_opening_net_value !== undefined) pairs.push(`资产池期初净额 ${money(assumption.pool_opening_net_value)}`);
   if (assumption.start_rule) pairs.push(assumption.start_rule === "CURRENT_MONTH" ? "当月开始计提" : "次月开始计提");
   return pairs.join("；") || "按规则默认参数执行";
 };
@@ -2162,6 +2177,479 @@ const drillToPolicy = async (assetRef) => {
   await openAssetDetail(assetRef);
 };
 
+const KNOWLEDGE_CHAT_STORAGE_KEY = "depreciation-knowledge-chat-v1";
+
+const knowledgeChatId = (prefix) => `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const activeKnowledgeThread = () => state.knowledgeChatThreads.find((item) => item.id === state.knowledgeChatActiveId) || null;
+
+const saveKnowledgeChatState = () => {
+  try {
+    localStorage.setItem(KNOWLEDGE_CHAT_STORAGE_KEY, JSON.stringify({
+      activeId: state.knowledgeChatActiveId,
+      threads: state.knowledgeChatThreads.slice(0, 30),
+    }));
+  } catch (error) {
+    console.warn("Unable to persist knowledge chat", error);
+  }
+};
+
+const loadKnowledgeChatState = () => {
+  if (state.knowledgeChatLoaded) return;
+  try {
+    const stored = JSON.parse(localStorage.getItem(KNOWLEDGE_CHAT_STORAGE_KEY) || "{}");
+    state.knowledgeChatThreads = Array.isArray(stored.threads)
+      ? stored.threads.map((thread) => ({ ...thread, externalConsent: true }))
+      : [];
+    state.knowledgeChatActiveId = stored.activeId || state.knowledgeChatThreads[0]?.id || null;
+  } catch (_error) {
+    state.knowledgeChatThreads = [];
+    state.knowledgeChatActiveId = null;
+  }
+  state.knowledgeChatLoaded = true;
+};
+
+const createKnowledgeThread = () => {
+  const thread = {
+    id: knowledgeChatId("thread"),
+    conversationId: null,
+    scenarioId: state.scenarioId,
+    externalConsent: true,
+    title: "新会话",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    messages: [],
+  };
+  state.knowledgeChatThreads.unshift(thread);
+  state.knowledgeChatActiveId = thread.id;
+  saveKnowledgeChatState();
+  return thread;
+};
+
+const ensureKnowledgeThread = () => {
+  loadKnowledgeChatState();
+  let thread = activeKnowledgeThread();
+  if (!thread || thread.scenarioId !== state.scenarioId) thread = createKnowledgeThread();
+  return thread;
+};
+
+const chatInlineMarkdown = (value) => escapeHtml(value)
+  .replace(/`([^`]+)`/g, "<code>$1</code>")
+  .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+
+const renderChatMarkdown = (value) => {
+  const lines = String(value || "").split("\n");
+  const html = [];
+  let listType = null;
+  let inCode = false;
+  let codeLines = [];
+  const closeList = () => {
+    if (listType) html.push(`</${listType}>`);
+    listType = null;
+  };
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      closeList();
+      if (inCode) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+      }
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+    const bullet = line.match(/^\s*[-*]\s+(.+)/);
+    const numbered = line.match(/^\s*\d+[.]\s+(.+)/);
+    if (bullet || numbered) {
+      const nextType = bullet ? "ul" : "ol";
+      if (listType !== nextType) {
+        closeList();
+        listType = nextType;
+        html.push(`<${listType}>`);
+      }
+      html.push(`<li>${chatInlineMarkdown((bullet || numbered)[1])}</li>`);
+      continue;
+    }
+    closeList();
+    if (!line.trim()) continue;
+    const heading = line.match(/^#{1,3}\s+(.+)/);
+    if (heading) html.push(`<h3>${chatInlineMarkdown(heading[1])}</h3>`);
+    else html.push(`<p>${chatInlineMarkdown(line)}</p>`);
+  }
+  closeList();
+  if (codeLines.length) html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+  return html.join("");
+};
+
+const renderKnowledgeChatThreads = () => {
+  const container = el("knowledgeChatThreads");
+  container.innerHTML = state.knowledgeChatThreads.map((thread) => `
+    <div class="chat-thread-row ${thread.id === state.knowledgeChatActiveId ? "active" : ""}" data-thread-id="${escapeHtml(thread.id)}">
+      <button class="chat-thread-select" type="button">
+        <strong>${escapeHtml(thread.title || "新会话")}</strong>
+        <span>${escapeHtml(thread.scenarioId || "BASELINE")}</span>
+      </button>
+      <button class="chat-thread-delete" type="button" aria-label="删除会话" title="删除会话">×</button>
+    </div>
+  `).join("");
+  container.querySelectorAll(".chat-thread-select").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.knowledgeChatActiveId = button.closest(".chat-thread-row").dataset.threadId;
+      saveKnowledgeChatState();
+      renderKnowledgeChat();
+    });
+  });
+  container.querySelectorAll(".chat-thread-delete").forEach((button) => {
+    button.addEventListener("click", () => {
+      const threadId = button.closest(".chat-thread-row").dataset.threadId;
+      state.knowledgeChatThreads = state.knowledgeChatThreads.filter((item) => item.id !== threadId);
+      if (state.knowledgeChatActiveId === threadId) state.knowledgeChatActiveId = state.knowledgeChatThreads[0]?.id || null;
+      ensureKnowledgeThread();
+      saveKnowledgeChatState();
+      renderKnowledgeChat();
+    });
+  });
+};
+
+const knowledgeChatSourceAction = async (source) => {
+  if (source.asset_ref) {
+    await showView("assets");
+    await openAssetDetail(source.asset_ref);
+    return;
+  }
+  if (source.object_id) {
+    await showView("graph");
+    const node = state.graph?.nodes?.find((item) => (item.id || item.object_id) === source.object_id);
+    if (node) selectGraphType(node.object_type);
+    await selectGraphNode(source.object_id);
+    return;
+  }
+  if (source.view) await showView(source.view);
+};
+
+const bindKnowledgeChatSources = () => {
+  document.querySelectorAll(".chat-source-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const thread = activeKnowledgeThread();
+      const message = thread?.messages.find((item) => item.id === button.dataset.messageId);
+      const source = message?.sources?.[Number(button.dataset.sourceIndex)];
+      if (source) await knowledgeChatSourceAction(source);
+    });
+  });
+};
+
+const renderKnowledgeChatActions = (actions = []) => actions.map((action) => {
+  if (action.type === "reverse_plan") {
+    return `<section class="chat-action-card"><strong>反向推演可应用方案</strong><p>选择方案后只会生成 What-if 草稿，不会立即创建场景。</p><div class="chat-action-options">${(action.recommendations || []).map((item, index) => `<button type="button" class="chat-action-button" data-action="reverse-draft" data-draft-id="${escapeHtml(action.draftId)}" data-recommendation-index="${index + 1}">生成方案 ${index + 1} 草稿 · ${escapeHtml(item.strategy_label_cn || item.strategy_key || "推荐方案")}</button>`).join("")}</div></section>`;
+  }
+  if (action.type === "action_draft" && action.draft) {
+    const draft = action.draft;
+    const preview = draft.preview || {};
+    return `<section class="chat-action-card pending"><strong>What-if 场景草稿</strong><p>${escapeHtml(draft.summary_cn || "已完成未落库试算。")}</p><p>基准：${escapeHtml(draft.base_scenario_id || "BASELINE")} · 差额：${escapeHtml(preview.difference || "-")}</p><label>场景名称<input class="chat-scenario-name" data-draft-id="${escapeHtml(draft.draft_id)}" value="${escapeHtml(draft.scenario_name || "")}"></label><div class="chat-action-options"><button type="button" class="chat-action-button primary" data-action="confirm-draft" data-draft-id="${escapeHtml(draft.draft_id)}">确认创建场景</button><button type="button" class="chat-action-button" data-action="cancel-draft" data-draft-id="${escapeHtml(draft.draft_id)}">取消草稿</button></div></section>`;
+  }
+  if (action.type === "comparison_result") {
+    const result = action.comparison || {};
+    return `<section class="chat-action-card"><strong>场景金额对比</strong><p>${escapeHtml(result.text || "已完成金额对比。")}</p><button type="button" class="chat-action-button" data-action="open-compare">打开场景对比</button></section>`;
+  }
+  return "";
+}).join("");
+
+const addKnowledgeChatActionMessage = (content, action = null) => {
+  const thread = ensureKnowledgeThread();
+  thread.messages.push({ id: knowledgeChatId("message"), role: "assistant", content, status: "done", sources: [], actions: action ? [action] : [] });
+  thread.updatedAt = new Date().toISOString();
+  saveKnowledgeChatState();
+  renderKnowledgeChat();
+};
+
+const bindKnowledgeChatActions = () => {
+  document.querySelectorAll(".chat-action-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.action;
+      try {
+        if (action === "open-compare") return showView("compare");
+        const draftId = button.dataset.draftId;
+        if (action === "reverse-draft") {
+          const created = await api(`/api/knowledge-chat/actions/${encodeURIComponent(draftId)}/draft-recommendation`, {
+            method: "POST", body: JSON.stringify({ recommendation_index: Number(button.dataset.recommendationIndex), conversation_id: activeKnowledgeThread()?.conversationId || "LOCAL-USER" }),
+          });
+          addKnowledgeChatActionMessage(created.summary_cn, { type: "action_draft", draft: created });
+        } else if (action === "confirm-draft") {
+          const name = document.querySelector(`.chat-scenario-name[data-draft-id="${CSS.escape(draftId)}"]`)?.value || "";
+          const confirmed = await api(`/api/knowledge-chat/actions/${encodeURIComponent(draftId)}/confirm`, { method: "POST", body: JSON.stringify({ scenario_name: name }) });
+          await loadScenarios();
+          await loadDashboard();
+          addKnowledgeChatActionMessage(confirmed.summary_cn);
+        } else if (action === "cancel-draft") {
+          const cancelled = await api(`/api/knowledge-chat/actions/${encodeURIComponent(draftId)}/cancel`, { method: "POST", body: "{}" });
+          addKnowledgeChatActionMessage(cancelled.message_cn);
+        }
+      } catch (error) {
+        addKnowledgeChatActionMessage(`操作失败：${error.message}`);
+      }
+    });
+  });
+};
+
+const renderKnowledgeChat = () => {
+  const thread = ensureKnowledgeThread();
+  renderKnowledgeChatProviderStatus();
+  renderKnowledgeChatThreads();
+  el("knowledgeChatContext").textContent = thread.scenarioId;
+  const container = el("knowledgeChatMessages");
+  if (!thread.messages.length) {
+    const suggestions = [
+      "解释产量法和工作量法的计算公式",
+      "资产201000121705-0在7月如何计算折旧？",
+      "当前平台有多少资产、规则和Ontology对象？",
+    ];
+    container.innerHTML = `
+      <div class="chat-empty-state">
+        <h2>询问平台知识</h2>
+        <div class="chat-suggestions">
+          ${suggestions.map((item) => `<button class="chat-suggestion" type="button" data-question="${escapeHtml(item)}">${escapeHtml(item)}</button>`).join("")}
+        </div>
+      </div>
+    `;
+    container.querySelectorAll(".chat-suggestion").forEach((button) => {
+      button.addEventListener("click", () => {
+        el("knowledgeChatInput").value = button.dataset.question;
+        resizeKnowledgeChatInput();
+        submitKnowledgeChat();
+      });
+    });
+    return;
+  }
+  container.innerHTML = thread.messages.map((message) => {
+    const streaming = message.status === "streaming";
+    const sourceHtml = message.sources?.length ? `
+      <div class="chat-source-list">
+        ${message.sources.map((source, index) => `<button class="chat-source-button" type="button" data-message-id="${escapeHtml(message.id)}" data-source-index="${index}">${escapeHtml(source.label || `证据${index + 1}`)}</button>`).join("")}
+      </div>
+    ` : "";
+    const meta = message.role === "assistant" && message.meta ? `
+      <div class="chat-response-meta">${escapeHtml(message.meta.error ? "DeepSeek Agent失败" : `DeepSeek Agent · ${message.meta.model || "DeepSeek"}${message.meta.toolCount ? ` · ${message.meta.toolCount}次工具调用` : ""}`)}${message.status === "stopped" ? " · 已停止" : ""}</div>
+    ` : "";
+    const actionHtml = message.actions?.length ? `<div class="chat-action-list">${renderKnowledgeChatActions(message.actions)}</div>` : "";
+    return `
+      <article class="chat-message-row ${message.role}" data-message-id="${escapeHtml(message.id)}">
+        <div class="chat-message-inner">
+          <div class="chat-message-content">
+            <span class="chat-message-role">${message.role === "user" ? "你" : "知识助手"}</span>
+            <div class="chat-message-body ${streaming ? "chat-stream-cursor" : ""}">${streaming ? multiline(message.content || message.progress || "正在理解问题") : renderChatMarkdown(message.content)}</div>
+            ${sourceHtml}${actionHtml}${meta}
+          </div>
+        </div>
+      </article>
+    `;
+  }).join("");
+  bindKnowledgeChatSources();
+  bindKnowledgeChatActions();
+  container.scrollTop = container.scrollHeight;
+};
+
+const updateStreamingKnowledgeMessage = (message) => {
+  const row = document.querySelector(`.chat-message-row[data-message-id="${message.id}"]`);
+  const body = row?.querySelector(".chat-message-body");
+  const elapsed = message.status === "streaming" && message.startedAt
+    ? ` · 已等待 ${Math.max(0, (Date.now() - message.startedAt) / 1000).toFixed(1)} 秒`
+    : "";
+  if (body) body.innerHTML = multiline(`${message.content || message.progress || "正在理解问题"}${elapsed}`);
+  const container = el("knowledgeChatMessages");
+  if (container) container.scrollTop = container.scrollHeight;
+};
+
+const resizeKnowledgeChatInput = () => {
+  const input = el("knowledgeChatInput");
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 144)}px`;
+};
+
+const setKnowledgeChatPending = (pending) => {
+  state.knowledgeChatPending = pending;
+  const button = el("knowledgeChatSendBtn");
+  button.textContent = pending ? "■" : "↑";
+  button.classList.toggle("stop", pending);
+  button.setAttribute("aria-label", pending ? "停止生成" : "发送");
+  button.title = pending ? "停止生成" : "发送";
+};
+
+const submitKnowledgeChat = async () => {
+  if (state.knowledgeChatPending) {
+    state.knowledgeChatAbortController?.abort();
+    return;
+  }
+  if (!state.knowledgeChatBackendReady) await refreshKnowledgeChatBackendStatus();
+  if (!state.knowledgeChatBackendReady) {
+    const thread = ensureKnowledgeThread();
+    const question = el("knowledgeChatInput").value.trim();
+    if (question) {
+      thread.messages.push({ id: knowledgeChatId("message"), role: "user", content: question, status: "done" });
+      thread.messages.push({
+        id: knowledgeChatId("message"), role: "assistant", status: "error", sources: [],
+        content: "当前页面连接的是旧版或不可用的问答后端，未发送问题。请打开最新服务地址后重试。",
+        meta: { error: true, usedLlm: false },
+      });
+      el("knowledgeChatInput").value = "";
+      resizeKnowledgeChatInput();
+      saveKnowledgeChatState();
+      renderKnowledgeChat();
+    }
+    renderKnowledgeChatProviderStatus();
+    return;
+  }
+  const input = el("knowledgeChatInput");
+  const question = input.value.trim();
+  if (!question) return;
+  const thread = ensureKnowledgeThread();
+  const userMessage = { id: knowledgeChatId("message"), role: "user", content: question, status: "done" };
+  thread.messages.push(userMessage);
+  if (thread.title === "新会话") thread.title = truncate(question, 26);
+  thread.updatedAt = new Date().toISOString();
+  const history = thread.messages.map((item) => ({ role: item.role, content: item.content }));
+  const assistantMessage = {
+    id: knowledgeChatId("message"), role: "assistant", content: "", status: "streaming", sources: [], actions: [], meta: null,
+    progress: "正在理解问题", startedAt: Date.now(),
+  };
+  thread.messages.push(assistantMessage);
+  input.value = "";
+  resizeKnowledgeChatInput();
+  setKnowledgeChatPending(true);
+  renderKnowledgeChat();
+  saveKnowledgeChatState();
+
+  const controller = new AbortController();
+  state.knowledgeChatAbortController = controller;
+  const thinkingTimer = window.setInterval(() => updateStreamingKnowledgeMessage(assistantMessage), 250);
+  try {
+    const response = await fetch("/api/knowledge-chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/x-ndjson" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        conversation_id: thread.conversationId,
+        scenario_id: thread.scenarioId,
+        question,
+        messages: history,
+        external_model_consent: Boolean(thread.externalConsent),
+      }),
+    });
+    if (!response.ok || !response.body) throw new Error(await response.text() || response.statusText);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.type === "meta") {
+          if (event.protocol_version !== "knowledge-agent-v2" || !event.agentic_tool_use) {
+            throw new Error("当前后端不是knowledge-agent-v2，已阻止使用旧问答策略。");
+          }
+          thread.conversationId = event.conversation_id;
+          assistantMessage.meta = { provider: event.provider, model: event.model };
+        } else if (event.type === "progress") {
+          assistantMessage.progress = event.text || "正在调用平台工具";
+          updateStreamingKnowledgeMessage(assistantMessage);
+        } else if (event.type === "delta") {
+          assistantMessage.progress = "";
+          assistantMessage.content += event.text || "";
+          updateStreamingKnowledgeMessage(assistantMessage);
+        } else if (event.type === "sources") {
+          assistantMessage.sources = event.sources || [];
+        } else if (event.type === "action_draft") {
+          assistantMessage.actions.push({ type: "action_draft", draft: event.draft });
+        } else if (event.type === "reverse_plan") {
+          assistantMessage.actions.push({ type: "reverse_plan", draftId: event.draft_id, recommendations: event.recommendations || [] });
+        } else if (event.type === "comparison_result") {
+          assistantMessage.actions.push({ type: "comparison_result", comparison: event.comparison });
+        } else if (event.type === "done") {
+          if (event.protocol_version !== "knowledge-agent-v2" || !event.used_llm) {
+            throw new Error("回答未由DeepSeek Agent生成。");
+          }
+          assistantMessage.status = "done";
+          assistantMessage.meta = {
+            usedLlm: Boolean(event.used_llm), model: event.model, provider: event.provider,
+            toolCount: event.tool_trace?.length || 0,
+          };
+        } else if (event.type === "error") {
+          throw new Error(event.error || "回答生成失败");
+        }
+      }
+      if (done) break;
+    }
+    if (!assistantMessage.content) assistantMessage.content = "当前没有生成可展示的回答。";
+    assistantMessage.status = "done";
+  } catch (error) {
+    if (error.name === "AbortError") {
+      assistantMessage.status = "stopped";
+      if (!assistantMessage.content) assistantMessage.content = "已停止生成。";
+    } else {
+      assistantMessage.status = "error";
+      assistantMessage.content = assistantMessage.content || `回答失败：${error.message}`;
+      assistantMessage.meta = { error: true, usedLlm: false };
+    }
+  } finally {
+    window.clearInterval(thinkingTimer);
+    thread.updatedAt = new Date().toISOString();
+    state.knowledgeChatAbortController = null;
+    setKnowledgeChatPending(false);
+    saveKnowledgeChatState();
+    renderKnowledgeChat();
+    input.focus();
+  }
+};
+
+const loadKnowledgeChat = async () => {
+  ensureKnowledgeThread();
+  await refreshKnowledgeChatBackendStatus();
+  renderKnowledgeChat();
+};
+
+const refreshKnowledgeChatBackendStatus = async () => {
+  state.knowledgeChatStatus = await softApi("/api/knowledge-chat/status", {
+    configured: false, provider: "unavailable", streaming: false,
+  });
+  state.knowledgeChatBackendReady = Boolean(
+    state.knowledgeChatStatus.configured
+    && state.knowledgeChatStatus.agentic_tool_use
+    && state.knowledgeChatStatus.protocol_version === "knowledge-agent-v2"
+  );
+  renderKnowledgeChatProviderStatus();
+};
+
+const renderKnowledgeChatProviderStatus = () => {
+  const container = el("knowledgeChatStatus");
+  if (!container) return;
+  const status = state.knowledgeChatStatus || {};
+  const thread = activeKnowledgeThread();
+  const input = el("knowledgeChatInput");
+  const send = el("knowledgeChatSendBtn");
+  input.disabled = false;
+  send.disabled = false;
+  if (status.protocol_version !== "knowledge-agent-v2" || !status.agentic_tool_use) {
+    container.textContent = "后端版本过旧 · 需要knowledge-agent-v2";
+    return;
+  }
+  if (!status.configured || status.external_model_available === false) {
+    container.textContent = "DeepSeek未配置 · 知识问答已停用";
+    return;
+  }
+  const liveEnabled = status.configured || thread?.externalConsent;
+  if (liveEnabled) {
+    container.textContent = `实时模型 · ${status.model || "DeepSeek"} · 数据库与Ontology证据`;
+    return;
+  }
+  container.textContent = "DeepSeek Agent未授权";
+};
+
 const showView = async (view) => {
   state.view = view;
   document.querySelectorAll(".nav-item").forEach((item) => {
@@ -2174,6 +2662,7 @@ const showView = async (view) => {
     overview: "预算总览",
     assets: "资产工作台",
     graph: "知识图谱",
+    chat: "知识问答",
     wide: "折旧宽表",
     whatif: "What-if 测算",
     reverse: "反向推演",
@@ -2192,6 +2681,7 @@ const showView = async (view) => {
   }
   if (view === "assets") await loadAssetWorkbench();
   if (view === "graph") await loadKnowledgeGraph();
+  if (view === "chat") await loadKnowledgeChat();
   if (view === "reverse") state.reverseCatalog = await softApi("/api/reverse-planning/catalog", null);
   if (view === "compare") await loadScenarioCompare();
 };
@@ -2211,10 +2701,24 @@ el("scenarioSelect").addEventListener("change", async () => {
   state.scenarioId = el("scenarioSelect").value;
   state.wideQuestionConversationId = null;
   state.reversePlanningConversationId = null;
+  if (state.view === "chat") createKnowledgeThread();
   await loadDashboard();
   await showView(state.view);
 });
 el("refreshBtn").addEventListener("click", refresh);
+el("knowledgeChatNewBtn").addEventListener("click", () => {
+  createKnowledgeThread();
+  renderKnowledgeChat();
+  el("knowledgeChatInput").focus();
+});
+el("knowledgeChatSendBtn").addEventListener("click", submitKnowledgeChat);
+el("knowledgeChatInput").addEventListener("input", resizeKnowledgeChatInput);
+el("knowledgeChatInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    submitKnowledgeChat();
+  }
+});
 el("wideSearchBtn").addEventListener("click", loadWideTable);
 ["wideDimension1", "wideDimension2", "wideDimension3"].forEach((id) => {
   el(id).addEventListener("change", () => {

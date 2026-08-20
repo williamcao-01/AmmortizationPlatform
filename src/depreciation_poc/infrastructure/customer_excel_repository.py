@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,14 @@ from depreciation_poc.domain.models import (
     ForecastLine, Month, MonthlyDriver, PlannedAsset, money, parse_decimal,
 )
 from depreciation_poc.infrastructure.xlsx_reader import read_sheet
+from depreciation_poc.source_schema import (
+    ASSET_CATEGORY_POLICY_FIELDS,
+    ASSET_MASTER_FIELDS,
+    ORGANIZATION_FIELDS,
+    PRODUCTION_DRIVER_FIELDS,
+    WORKLOAD_DRIVER_FIELDS,
+    source_properties,
+)
 
 
 CODE_METHODS = {
@@ -22,19 +31,20 @@ CODE_METHODS = {
 
 REQUIRED_WORKBOOKS = (
     "资产明细表_资产台账明细_20260812.xlsx",
-    "资产相关配置表_20260812.xlsx",
+    "资产相关配置表_20260819.xlsx",
+    "组织机构表_所属单位表_20260810.xlsx",
 )
 
 
 class CustomerExcelRepository:
-    """Maps the four fixed customer workbooks into the application DTO contract."""
+    """Maps the three controlled customer workbooks into the application DTO contract."""
 
     def __init__(self, data_dir: str | Path) -> None:
         self.data_dir = Path(data_dir)
         self._validate_source_directory()
         self.asset_file = self.data_dir / REQUIRED_WORKBOOKS[0]
         self.config_file = self.data_dir / REQUIRED_WORKBOOKS[1]
-        self.organization_file = None
+        self.organization_file = self.data_dir / REQUIRED_WORKBOOKS[2]
         self.asset_rows = self._sheet(self.asset_file, "在账资产明细")
         self.code_rows = read_sheet(self.config_file, "折旧码")
         self.category_rows = read_sheet(self.config_file, "资产类别表")
@@ -52,7 +62,7 @@ class CustomerExcelRepository:
         expected = sorted(REQUIRED_WORKBOOKS)
         if workbook_names != expected:
             raise ValueError(
-                "客户数据目录只能包含当前两份受控 Excel："
+                "客户数据目录只能包含当前三份受控 Excel："
                 f"{'、'.join(expected)}；当前发现：{'、'.join(workbook_names) or '无 Excel 文件'}。"
             )
 
@@ -87,6 +97,92 @@ class CustomerExcelRepository:
 
     def excluded_assets(self) -> list[dict[str, str]]:
         return list(self._excluded_assets)
+
+    def organization_units(self) -> list[dict[str, str]]:
+        """Return normalized organization hierarchy records for ontology projection."""
+        return [
+            {
+                "code": _value(row, "所属单位"),
+                "name": _value(row, "所属单位名称") or _value(row, "所属单位"),
+                "short_name": _value(row, "单位简称"),
+                "parent_code": _value(row, "父编码"),
+                "level": _value(row, "单位级别"),
+                "is_detail": _value(row, "是否明细"),
+                "enabled": _value(row, "是否启用"),
+                "company": _value(row, "公司"),
+                "cost_center": _value(row, "成本中心"),
+                "profit_center": _value(row, "利润中心"),
+                "source_properties": source_properties(row, ORGANIZATION_FIELDS),
+            }
+            for row in self.organization_rows
+            if _value(row, "所属单位")
+        ]
+
+    def ontology_asset_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for index, row in enumerate(self.asset_rows, start=2):
+            asset_no = _value(row, "主资产号", "资产主号", "资产编号")
+            sub_no = _value(row, "资产子编号", "子资产号", "子号") or "0"
+            asset_id = f"{asset_no}-{sub_no}" if asset_no else _value(row, "唯一标识", "唯一ID", "唯一码")
+            code = _value(row, "折旧码")
+            exclusion_reason = _exclusion_reason(row, code)
+            records.append({
+                "asset_id": asset_id or f"ROW-{index}",
+                "name": _value(row, "资产名称") or asset_id or f"ROW-{index}",
+                "source_row": index,
+                "calculation_included": exclusion_reason is None,
+                "exclusion_reason": exclusion_reason or "",
+                "company": _value(row, "公司代码", "公司") or "DEFAULT",
+                "organization_id": _value(row, "所属单位"),
+                "department": _value(row, "所属单位名称", "所属单位") or "未分配单位",
+                "cost_center": _value(row, "成本中心") or "未分配成本中心",
+                "cost_center_name": _value(row, "成本中心描述"),
+                "profit_center": _value(row, "利润中心") or "未分配利润中心",
+                "profit_center_name": _value(row, "利润中心描述"),
+                "asset_category": _value(row, "资产类别", "资产类别编码") or "CUSTOMER_ASSET",
+                "depreciation_code": code,
+                "block_id": _value(row, "所属区块", "区块"),
+                "properties": source_properties(row, ASSET_MASTER_FIELDS),
+            })
+        return records
+
+    def ontology_category_policy_records(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "record_id": f"资产类别表-ROW-{index}",
+                "source_row": index,
+                "category_id": _value(row, "资产类别编码", "资产类别"),
+                "depreciation_code": _value(row, "折旧码"),
+                "properties": source_properties(row, ASSET_CATEGORY_POLICY_FIELDS),
+            }
+            for index, row in enumerate(self.category_rows, start=2)
+        ]
+
+    def ontology_monthly_driver_records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for index, row in enumerate(self.block_rows, start=2):
+            year = _int(_value(row, "会计年度", "年", "年份"))
+            month = _int(_value(row, "期间", "月", "月份"))
+            records.append({
+                "record_id": f"所属区块-ROW-{index}",
+                "driver_type": "PRODUCTION",
+                "target_id": _value(row, "所属区块", "区块"),
+                "period": f"{year:04d}-{month:02d}" if year and month else "",
+                "source_row": index,
+                "properties": source_properties(row, PRODUCTION_DRIVER_FIELDS),
+            })
+        for index, row in enumerate(self._workload_rows_flat(), start=2):
+            year = _int(_value(row, "会计年度", "年", "年份"))
+            month = _int(_value(row, "期间", "月", "月份"))
+            records.append({
+                "record_id": f"工作量法-ROW-{index}",
+                "driver_type": "WORKLOAD",
+                "target_id": _value(row, "所属单位"),
+                "period": f"{year:04d}-{month:02d}" if year and month else "",
+                "source_row": index,
+                "properties": source_properties(row, WORKLOAD_DRIVER_FIELDS),
+            })
+        return records
 
     def load_planned_assets(self) -> list[PlannedAsset]:
         return []
@@ -148,11 +244,26 @@ class CustomerExcelRepository:
             "asset_count": len(self._assets),
             "excluded_asset_count": len(self._excluded_assets),
             "organization_count": len(self.organization_rows),
+            "asset_source_row_count": len(self.asset_rows),
+            "category_policy_row_count": len(self.category_rows),
+            "monthly_driver_source_row_count": len(self.block_rows) + len(self._workload_rows_flat()),
+            "baseline_period_from": str(self.baseline_period_range()[0]),
+            "baseline_period_to": str(self.baseline_period_range()[1]),
             "source_files": [
                 *[path.name for path in (self.asset_file, self.config_file, self.organization_file) if path],
             ],
             "organization_source_status": "已加载" if self.organization_file else "未提供组织机构表；计算使用资产台账所属单位字段。",
+            "source_fingerprint": self._source_fingerprint(),
         }
+
+    def _source_fingerprint(self) -> str:
+        digest = sha256()
+        for path in (self.asset_file, self.config_file, self.organization_file):
+            digest.update(path.name.encode("utf-8"))
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
 
     def verified_forecast_months(self, start_period: Month, *, maximum: int = 6) -> int:
         """Return the consecutive future months fully covered by customer driver inputs.
@@ -186,6 +297,19 @@ class CustomerExcelRepository:
                 break
             covered += 1
         return covered
+
+    def baseline_period_range(self) -> tuple[Month, Month]:
+        periods: list[Month] = []
+        for row in [*self.block_rows, *self._workload_rows_flat()]:
+            year = _int(_value(row, "会计年度", "年", "年份"))
+            month = _int(_value(row, "期间", "月", "每", "月份"))
+            if year >= 2000 and 1 <= month <= 12:
+                periods.append(Month(year, month))
+        if not periods:
+            snapshot = Month.parse(self._snapshot_period())
+            return snapshot, snapshot
+        ordered = sorted(periods, key=lambda item: (item.year, item.month))
+        return ordered[0], ordered[-1]
 
     def dimension_catalog(self) -> dict[str, Any]:
         """Business labels used by the financial wide-table, derived from the snapshot."""
@@ -226,14 +350,14 @@ class CustomerExcelRepository:
                 production = _average(rows, "区块总产量", "月总产量（吨/万方）", "总产量", "当月产量")
                 reserves = _average(rows, "区块总储量", "月总储量（吨/万方）", "总储量", "剩余储量")
                 depletion_rate = _optional_average(rows, "折耗率")
-                company = _value(rows[0], "公司代码", "公司") or "DEFAULT"
+                company = (_value(rows[0], "公司代码", "公司") or "DEFAULT") if rows else "DEFAULT"
                 refs = tuple(f"{self.config_file.name}:所属区块:{source_year}-{source_month:02d}:{block}" for _ in rows)
                 drivers.append(MonthlyDriver(
                     driver_type="PRODUCTION", period=period, company=company, target_id=block,
                     production=production, reserves=reserves, depletion_rate=depletion_rate, source_refs=refs,
                     assumption_note=(
                         f"使用 {source_year}-{source_month:02d} 区块配置参数。"
-                        if not is_carry_forward else f"未提供 {period} 区块参数，沿用 {source_year}-{source_month:02d} 参数作为基准假设。"
+                        if rows else f"未提供 {period} 区块参数，按零值处理。"
                     ),
                 ))
         workload_rows = self._workload_rows()
@@ -244,8 +368,9 @@ class CustomerExcelRepository:
                 rows, source_year, source_month, is_carry_forward = self._workload_rows_for_period(workload_rows, target, period.year, period.month)
                 drivers.append(MonthlyDriver(
                     driver_type="WORKLOAD", period=period, company=_value(rows[0], "公司代码", "公司") if rows else "DEFAULT", target_id=target,
-                    workload=_average(rows, "单位数", "工作量"), unit_fee=Decimal("0"),
-                    total_amortization=_average(rows, "总计", "当月总摊销额") if rows else None,
+                    workload=Decimal("0"), unit_fee=Decimal("0"),
+                    total_amortization=_average(rows, "单位数", "当月总摊销额") if rows else None,
+                    pool_opening_net_value=_average(rows, "总计", "资产池期初净额", "总资产净额") if rows else None,
                     source_refs=tuple(f"{self.config_file.name}:工作量法:{source_year}-{source_month:02d}:{target}" for _ in rows),
                     assumption_note=(
                         f"使用 {source_year}-{source_month:02d} 工作量法配置参数。"
@@ -259,11 +384,7 @@ class CustomerExcelRepository:
         exact = by_period_block.get((code, block, year, month))
         if exact:
             return exact, year, month, False
-        candidates = [key for key in by_period_block if key[:2] == (code, block) and (key[2], key[3]) < (year, month)]
-        if not candidates:
-            return [], year, month, True
-        source = max(candidates, key=lambda key: (key[2], key[3]))
-        return by_period_block[source], source[2], source[3], True
+        return [], year, month, False
 
     def _workload_rows(self) -> dict[tuple[str, int, int], list[dict[str, str]]]:
         grouped: dict[tuple[str, int, int], list[dict[str, str]]] = defaultdict(list)
@@ -302,11 +423,17 @@ class CustomerExcelRepository:
         for row in self.category_rows:
             category = _value(row, "资产类别编码", "资产类别")
             if category:
-                names[category] = _value(row, "资产类别名称", "名称") or category
+                configured_name = _value(row, "资产类别名称", "名称")
+                if configured_name:
+                    names[category] = configured_name
         for row in self.asset_rows:
             category = _value(row, "资产类别", "资产类别编码")
             if category:
-                names.setdefault(category, _value(row, "资产类别名称", "资产类别描述") or category)
+                ledger_name = _value(row, "资产类别名称", "资产类别描述")
+                if ledger_name and (category not in names or names[category] == category):
+                    names[category] = ledger_name
+                else:
+                    names.setdefault(category, category)
         categories = [AssetCategory(category, name, "CUSTOMER_ASSET") for category, name in sorted(names.items())]
         return [AssetCategory("CUSTOMER_ASSET", "客户资产", None), *categories]
 
@@ -329,7 +456,7 @@ class CustomerExcelRepository:
         excluded: list[dict[str, str]] = []
         for index, row in enumerate(self.asset_rows, start=2):
             asset_no = _value(row, "主资产号", "资产主号", "资产编号")
-            sub_no = _value(row, "子资产号", "子号") or "0"
+            sub_no = _value(row, "资产子编号", "子资产号", "子号") or "0"
             asset_id = f"{asset_no}-{sub_no}" if asset_no else _value(row, "唯一标识", "唯一ID")
             code = _value(row, "折旧码")
             exclusion_reason = _exclusion_reason(row, code)
@@ -361,7 +488,7 @@ class CustomerExcelRepository:
                 original_cost=_decimal(_value(row, "资产原值", "原值")),
                 in_service_date=_date_value(_value(row, "资本化日期", "启用日期", "投产日期")),
                 accumulated_depreciation=_decimal(_value(row, "累计折旧")),
-                accumulated_impairment=_decimal(_value(row, "累计减值", "累计减值准备")),
+                accumulated_impairment=_decimal(_value(row, "累计减值", "累计减值准备", "减值金额")),
                 status=_value(row, "资产状态", "使用状态") or "在账",
                 block_id=_value(row, "所属区块", "区块") or None,
                 useful_life_months=useful_life,
@@ -374,6 +501,8 @@ class CustomerExcelRepository:
                 organization_id=_value(row, "所属单位"),
                 snapshot_monthly_depreciation=_decimal(_value(row, "本月折旧", "当月折旧")),
                 snapshot_net_value=_decimal(_value(row, "净额", "净值")),
+                cost_center_name=_value(row, "成本中心描述"),
+                profit_center_name=_value(row, "利润中心描述"),
             ))
         return result, excluded
 

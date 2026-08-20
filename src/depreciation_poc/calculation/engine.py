@@ -141,7 +141,11 @@ class DepreciationCalculationEngine:
         total_depreciable = asset.original_cost * (Decimal("1") - policy.residual_rate)
         elapsed_months = max(0, min(policy.useful_life_months, first_month.months_until(start_period)))
         original_monthly_amount = total_depreciable / Decimal(policy.useful_life_months)
-        accumulated_depreciation = max(asset.accumulated_depreciation, money(original_monthly_amount * elapsed_months))
+        accumulated_depreciation = (
+            money(asset.accumulated_depreciation)
+            if policy.method == "PRODUCTION"
+            else max(asset.accumulated_depreciation, money(original_monthly_amount * elapsed_months))
+        )
         accumulated_impairment = asset.accumulated_impairment
         disposed = False
         lines: list[ForecastLine] = []
@@ -213,29 +217,28 @@ class DepreciationCalculationEngine:
         if policy.method == "PRODUCTION":
             driver = drivers.get(("PRODUCTION", asset.block_id or "", str(period)))
             production = driver.production if driver else ZERO
-            reserves = driver.reserves if driver else ZERO
-            configured_rate = driver.depletion_rate if driver else None
-            if configured_rate is not None:
-                rate = min(max(configured_rate, ZERO), Decimal("1"))
-                branch = "CONFIGURED_DEPLETION_RATE"
-                conclusion = "按区块配置表提供的折耗率计算折耗。"
-            elif reserves <= ZERO:
+            total_reserves = driver.reserves if driver else ZERO
+            source_rate = driver.depletion_rate if driver else None
+            if total_reserves <= ZERO:
                 rate, branch = Decimal("1"), "NO_RESERVES"
-                conclusion = "剩余储量为零，按规则一次性折耗剩余净值。"
+                conclusion = "当期总储量为零，按规则一次性折耗剩余账面净额。"
             elif production <= ZERO:
                 rate, branch = ZERO, "NO_PRODUCTION"
-                conclusion = "有剩余储量但当月无产量，按规则不计提折耗。"
-            elif production >= reserves:
+                conclusion = "当期无产量，按规则不计提折耗。"
+            elif production >= total_reserves:
                 rate, branch = Decimal("1"), "PRODUCTION_EXCEEDS_RESERVES"
-                conclusion = "当月产量不小于剩余储量，折耗率封顶为 100%。"
+                conclusion = "当期产量不小于当期总储量，折耗率封顶为 100%。"
             else:
-                rate, branch = production / reserves, "NORMAL_PRODUCTION"
-                conclusion = "按当月产量与剩余储量的比例计算折耗。"
-            amount = max(money(opening_net_value * rate), ZERO)
-            return amount, branch, "月折耗 = 期初净值 × 折耗率", {
-                "区块": asset.block_id or "-", "当月产量": str(production), "剩余储量": str(reserves),
-                "折耗率": str(rate), "期初净值": str(opening_net_value),
-                "折耗率来源": "区块配置表" if configured_rate is not None else "由产量/储量计算",
+                rate, branch = production / total_reserves, "NORMAL_PRODUCTION"
+                conclusion = "按当期产量除以当期总储量计算折耗率。"
+            current_capitalized_cost = ZERO
+            calculation_base = max(opening_net_value + current_capitalized_cost, ZERO)
+            amount = min(max(money(calculation_base * rate), ZERO), calculation_base)
+            return amount, branch, "当期折耗额 =（期初油气资产账面净额 + 当期资本化油气资产原值）× 当期折耗率", {
+                "区块": asset.block_id or "-", "当期产量": str(production), "当期总储量": str(total_reserves),
+                "当期折耗率": str(rate), "配置表折耗率": str(source_rate) if source_rate is not None else "-",
+                "期初油气资产账面净额": str(opening_net_value), "当期资本化油气资产原值": str(current_capitalized_cost),
+                "折耗率公式": "当期产量 ÷ 当期总储量",
             }, conclusion
         month_index = first_month.months_until(period)
         if not 0 <= month_index < policy.useful_life_months:
@@ -273,14 +276,29 @@ class DepreciationCalculationEngine:
                 )
                 eligible = [(asset, policy) for asset, policy in members if period >= first_depreciation_month(asset.in_service_date, policy.start_rule) and balances[asset.asset_id] > ZERO]
                 total_net = sum((balances[asset.asset_id] for asset, _ in eligible), ZERO)
+                configured_pool_net = money(
+                    driver.pool_opening_net_value
+                    if driver and driver.pool_opening_net_value is not None
+                    else total_net
+                )
+                calculation_pool_net = configured_pool_net if configured_pool_net > ZERO else total_net
                 for asset, policy in members:
                     opening_net = balances[asset.asset_id]
-                    if asset not in [item[0] for item in eligible] or total_net <= ZERO or total_amortization <= ZERO:
+                    if opening_net <= ZERO:
+                        amount, branch = ZERO, "NO_REMAINING_NET"
+                        conclusion = "资产期初净额为零，本月不再摊销。"
+                    elif asset not in [item[0] for item in eligible] or calculation_pool_net <= ZERO or total_amortization <= ZERO:
                         amount, branch = ZERO, "NO_WORKLOAD"
-                        conclusion = "当月工作量或单位费用为零，未形成工作量法摊销。"
+                        conclusion = "当月总摊销额或资产池期初净额为零，未形成工作量法摊销。"
                     else:
-                        amount = min(money(total_amortization * opening_net / total_net), opening_net)
-                        branch, conclusion = "WORKLOAD_ALLOCATION", "按资产期初净值占工作量法资产净额的比例分摊。"
+                        raw_amount = money(total_amortization * opening_net / calculation_pool_net)
+                        amount = min(raw_amount, opening_net)
+                        branch = "WORKLOAD_FULL_AMORTIZATION" if raw_amount >= opening_net else "WORKLOAD_ALLOCATION"
+                        conclusion = (
+                            "公式计算额超过资产期初净额，按资产期初净额封顶摊销。"
+                            if branch == "WORKLOAD_FULL_AMORTIZATION"
+                            else "按资产期初净额占工作量法资产池期初净额的比例分摊。"
+                        )
                     balances[asset.asset_id] = money(opening_net - amount)
                     accumulated[asset.asset_id] = money(accumulated[asset.asset_id] + amount)
                     line = ForecastLine(
@@ -299,10 +317,11 @@ class DepreciationCalculationEngine:
                     )
                     lines.append(line)
                     self._record(scenario_id, asset.asset_id, period, policy.policy_id, branch,
-                                 "月摊销 = 当月总摊销额 × 资产期初净值 ÷ 工作量法资产期初净额", {
+                                 "月折旧额 = 资产期初净额 ×（当月总摊销额 ÷ 资产池期初净额）", {
                                      "工作量": str(workload), "单位费用": str(unit_fee), "当月总摊销额": str(total_amortization),
                                      "总摊销额来源": "工作量法配置表" if driver and driver.total_amortization is not None else "工作量 × 单位费用",
-                                     "资产期初净值": str(opening_net), "资产池期初净额": str(total_net),
+                                     "资产期初净额": str(opening_net), "配置资产池期初净额": str(configured_pool_net),
+                                     "台账资产池期初净额": str(total_net), "计算采用资产池期初净额": str(calculation_pool_net),
                                  }, conclusion)
         return lines
 

@@ -327,6 +327,7 @@ class WideTableQATools:
     available_periods: Callable[[str], list[str]] | None = None
     entity_catalog: Callable[[str], dict[str, list[str]]] | None = None
     graph_read_status: Callable[[], dict[str, Any]] | None = None
+    evidence_gateway: Callable[[str, str, dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -539,6 +540,10 @@ class WideTableQASkill:
 
         plan = validation["plan"]
         execution = self._execute_plan(question=question, plan=plan)
+        self._confirm_ontology_evidence(
+            scenario_id=scenario_id,
+            execution=execution,
+        )
         self._annotate_trace_source(execution["harness"]["tool_trace"])
         composition_context = self._composition_context(
             question=question,
@@ -571,6 +576,7 @@ class WideTableQASkill:
             "reasoning_steps": execution["reasoning_steps"],
             "graph_reasoning": execution.get("graph_reasoning"),
             "ontology_paths": execution.get("ontology_paths", []),
+            "ontology_gateway": execution.get("ontology_gateway"),
             "rule_execution_trace": execution.get("rule_execution_trace", []),
             "harness": execution["harness"],
             "evidence": execution["evidence"],
@@ -586,6 +592,21 @@ class WideTableQASkill:
             "audit_id": audit_id,
             "qa_skill": self._skill_metadata(generation, execution["harness"]["tool_trace"]),
         }
+
+    def _confirm_ontology_evidence(self, *, scenario_id: str, execution: dict[str, Any]) -> None:
+        if self.tools.evidence_gateway is None:
+            raise RuntimeError("宽表问答未配置Ontology Evidence Gateway，禁止生成回答。")
+        receipt = self.tools.evidence_gateway(
+            "wide_table_qa_answer",
+            scenario_id,
+            dict(execution.get("evidence") or {}),
+            {"recommendations": []},
+        )
+        if receipt.get("status") not in {"verified", "missing_after_query"} or receipt.get("query_executed") is not True:
+            raise RuntimeError("宽表问答证据未通过Ontology Evidence Gateway确认。")
+        execution["ontology_gateway"] = receipt
+        evidence = execution.setdefault("evidence", {})
+        evidence["ontology_gateway"] = receipt
 
     def catalog(self, scenario_id: str = "BASELINE") -> dict[str, Any]:
         periods = self.tools.available_periods(scenario_id) if self.tools.available_periods else []
@@ -663,7 +684,7 @@ class WideTableQASkill:
         status = self.tools.graph_read_status() if self.tools.graph_read_status else {"active": False}
         for item in trace:
             if item.get("tool_name") in {"list_available_periods", "resolve_ontology_entities", "query_forecast_lines", "compare_forecast_periods", "get_rule_execution_evidence", "trace_asset_policy_path"}:
-                item["data_source"] = "Neo4j / Cypher" if status.get("active") else "SQLite / SQL fallback"
+                item["data_source"] = "Neo4j / Cypher"
                 item["query_mode"] = "parameterized_read_only"
             else:
                 item["data_source"] = "Harness deterministic aggregation"
@@ -1563,9 +1584,9 @@ class WideTableQASkill:
             life = target_inputs.get("使用年限(月)") or "-"
             return f"年限平均法规则在目标月命中“折旧到期”分支，使用年限为 {life} 个月，因此目标月不再计提。"
 
-        if target_branch == "CONFIGURED_DEPLETION_RATE":
+        if target_branch in {"NORMAL_PRODUCTION", "NO_PRODUCTION", "NO_RESERVES", "PRODUCTION_EXCEEDS_RESERVES"}:
             changes = []
-            for label in ("区块", "当月产量", "剩余储量", "折耗率"):
+            for label in ("区块", "当期产量", "当期总储量", "当期折耗率"):
                 before = previous_inputs.get(label)
                 after = target_inputs.get(label)
                 if before is not None and after is not None:
@@ -1575,15 +1596,14 @@ class WideTableQASkill:
                         changes.append(f"区块为 {after}")
             changed_text = "，".join(changes) or "区块配置参数按目标月取值"
             return (
-                f"产量法按“期初净值 × 区块配置折耗率”计算；{changed_text}。"
-                "折耗率直接读取区块配置表。"
+                f"产量法先按“当期产量 ÷ 当期总储量”计算折耗率，再乘以期初账面净额及当期资本化原值；{changed_text}。"
             )
 
-        if target_branch == "WORKLOAD_ALLOCATION":
+        if target_branch in {"WORKLOAD_ALLOCATION", "WORKLOAD_FULL_AMORTIZATION"}:
             total = target_inputs.get("当月总摊销额") or "-"
-            pool = target_inputs.get("资产池期初净额") or "-"
+            pool = target_inputs.get("计算采用资产池期初净额") or "-"
             return (
-                "工作量法按“当月总摊销额 × 资产期初净值 ÷ 资产池期初净额”分摊；"
+                "工作量法按“当月总摊销额 × 资产期初净额 ÷ 资产池期初净额”分摊；"
                 f"配置表当月总摊销额为 {total}，资产池期初净额为 {pool}。"
             )
 

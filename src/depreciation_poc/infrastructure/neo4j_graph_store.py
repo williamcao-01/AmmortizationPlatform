@@ -5,7 +5,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
-from depreciation_poc.ontology_model import LinkInstance, ObjectInstance
+from depreciation_poc.ontology_model import (
+    ActionTypeDefinition,
+    FunctionTypeDefinition,
+    LinkInstance,
+    LinkTypeDefinition,
+    ObjectInstance,
+    ObjectTypeDefinition,
+)
 
 
 class Neo4jOntologyStore:
@@ -48,6 +55,61 @@ class Neo4jOntologyStore:
                 """,
                 relationships=relationships,
             ).consume()
+
+    def sync_schema(
+        self,
+        *,
+        object_types: list[ObjectTypeDefinition],
+        link_types: list[LinkTypeDefinition],
+        action_types: list[ActionTypeDefinition],
+        function_types: list[FunctionTypeDefinition],
+    ) -> None:
+        payload = {
+            "object_types": [
+                {
+                    "type_id": item.type_id,
+                    "label_cn": item.label_cn,
+                    "description_cn": item.description_cn,
+                    "properties": [
+                        {"property_id": prop.property_id, "label_cn": prop.label_cn, "value_type": prop.value_type}
+                        for prop in item.properties
+                    ],
+                }
+                for item in object_types
+            ],
+            "link_types": [
+                {
+                    "type_id": item.type_id, "label_cn": item.label_cn,
+                    "source_type": item.source_type, "target_type": item.target_type,
+                    "description_cn": item.description_cn,
+                }
+                for item in link_types
+            ],
+            "action_types": [
+                {
+                    "type_id": item.type_id, "label_cn": item.label_cn,
+                    "target_types": item.target_types, "description_cn": item.description_cn,
+                }
+                for item in action_types
+            ],
+            "function_types": [
+                {"type_id": item.type_id, "label_cn": item.label_cn, "description_cn": item.description_cn}
+                for item in function_types
+            ],
+        }
+        with self.driver.session(database=self.database) as session:
+            session.run("MATCH (n:OntologySchema) DETACH DELETE n").consume()
+            session.run(
+                "CREATE (n:OntologySchema {schema_id: 'ACTIVE', schema_json: $schema_json, updated_at: datetime()})",
+                schema_json=json.dumps(payload, ensure_ascii=False),
+            ).consume()
+
+    def ontology_meta(self) -> dict[str, Any]:
+        with self.driver.session(database=self.database) as session:
+            row = session.run("MATCH (n:OntologySchema {schema_id: 'ACTIVE'}) RETURN n.schema_json AS value").single()
+        if row is None:
+            return {"object_types": [], "link_types": [], "action_types": [], "function_types": []}
+        return json.loads(row["value"])
 
     def objects(self) -> list[dict[str, Any]]:
         query = """
@@ -93,6 +155,67 @@ class Neo4jOntologyStore:
             record = session.run(query, from_id=from_id, to_id=to_id).single()
         return [self._relationship_record(item) for item in record["links"]] if record else []
 
+    def triples(self, *, limit: int = 300) -> list[dict[str, Any]]:
+        return [
+            {
+                "subject": item["source_object_id"],
+                "predicate": item["link_type"],
+                "object": item["target_object_id"],
+                "inferred": item["inferred"],
+            }
+            for item in self.links()[:limit]
+        ]
+
+    def ancestors_including_self(self, category_id: str) -> list[str]:
+        query = """
+        MATCH path=(category:OntologyObject {object_id: $category_id})-[:BUSINESS_RELATION*0..12]->(ancestor:OntologyObject)
+        WHERE all(rel IN relationships(path) WHERE rel.link_type = 'categoryInheritsCategory')
+        RETURN ancestor.technical_ref AS category_id, length(path) AS depth
+        ORDER BY depth
+        """
+        with self.driver.session(database=self.database) as session:
+            values = [str(row["category_id"]) for row in session.run(query, category_id=f"AssetCategory:{category_id}")]
+        return values or [category_id]
+
+    def explain_policy_match(self, *, company: str, perspective: str, asset_category: str) -> dict[str, Any] | None:
+        query = """
+        MATCH path=(category:OntologyObject {object_id: $category_id})-[:BUSINESS_RELATION*0..12]->(matched:OntologyObject)
+        WHERE all(rel IN relationships(path) WHERE rel.link_type = 'categoryInheritsCategory')
+        MATCH (policy:OntologyObject)-[:BUSINESS_RELATION {link_type: 'policyAppliesToCategory'}]->(matched)
+        WHERE policy.company = $company AND policy.perspective = $perspective
+        RETURN policy.technical_ref AS policy_id, matched.technical_ref AS matched_category, length(path) AS depth
+        ORDER BY depth
+        LIMIT 1
+        """
+        with self.driver.session(database=self.database) as session:
+            row = session.run(
+                query,
+                category_id=f"AssetCategory:{asset_category}",
+                company=company,
+                perspective=perspective,
+            ).single()
+        if row is None:
+            return None
+        policy_id = str(row["policy_id"])
+        matched_category = str(row["matched_category"])
+        return {
+            "policy_id": policy_id,
+            "matched_category": matched_category,
+            "asset_category": asset_category,
+            "company": company,
+            "perspective": perspective,
+            "proof": [
+                {
+                    "subject": f"AssetCategory:{asset_category}", "predicate": "categoryInheritsCategory*",
+                    "object": f"AssetCategory:{matched_category}", "inferred": matched_category != asset_category,
+                },
+                {
+                    "subject": f"DepreciationPolicy:{policy_id}", "predicate": "policyAppliesToCategory",
+                    "object": f"AssetCategory:{matched_category}", "inferred": False,
+                },
+            ],
+        }
+
     def forecast_lines(
         self,
         *,
@@ -100,6 +223,7 @@ class Neo4jOntologyStore:
         department: str | None = None,
         asset_category: str | None = None,
         asset_source_type: str | None = None,
+        asset_refs: list[str] | None = None,
         period_from: str | None = None,
         period_to: str | None = None,
         limit: int = 200,
@@ -122,6 +246,9 @@ class Neo4jOntologyStore:
         if period_to:
             clauses.append("record.period <= $period_to")
             params["period_to"] = period_to
+        if asset_refs:
+            clauses.append("coalesce(record.asset_id, record.planned_asset_id) IN $asset_refs")
+            params["asset_refs"] = asset_refs
         query = f"""
         MATCH (record:ForecastRecord)
         WHERE {' AND '.join(clauses)}
@@ -206,6 +333,33 @@ class Neo4jOntologyStore:
                 scenario_object_id=f"Scenario:{scenario_id}",
                 scope_value=scope_value,
             ) if item["asset_ref"]]
+
+    def reverse_action_capabilities(
+        self,
+        *,
+        scenario_id: str,
+        scope_type: str,
+        scope_value: str,
+    ) -> dict[str, list[str]]:
+        """Read action eligibility from ontology links, not a Python template allow-list."""
+        field = {"company": "company", "department": "department", "asset_category": "asset_category"}.get(scope_type)
+        if field is None:
+            return {}
+        query = f"""
+        MATCH (:OntologyObject {{object_id: $scenario_object_id}})-[:HAS_FORECAST_RECORD]->(record:ForecastRecord)
+              -[:CALCULATED_FOR]->(asset:OntologyObject {{object_type: 'FixedAsset'}})
+        MATCH (asset)-[:BUSINESS_RELATION {{link_type: 'assetUsesDepreciationCode'}}]->(:OntologyObject)
+              -[:BUSINESS_RELATION {{link_type: 'codeUsesMethod'}}]->(method:OntologyObject)
+              -[:BUSINESS_RELATION {{link_type: 'methodAllowsReverseAction'}}]->(capability:OntologyObject {{object_type: 'ReverseActionCapability'}})
+        WHERE record.{field} = $scope_value
+        RETURN asset.technical_ref AS asset_ref, collect(DISTINCT capability.technical_ref) AS capabilities
+        """
+        with self.driver.session(database=self.database) as session:
+            return {
+                str(item["asset_ref"]): [str(value) for value in item["capabilities"] if value]
+                for item in session.run(query, scenario_object_id=f"Scenario:{scenario_id}", scope_value=scope_value)
+                if item["asset_ref"]
+            }
 
     def policy_object_id_for_asset(self, asset_object_id: str) -> str | None:
         query = """
@@ -374,6 +528,11 @@ class Neo4jOntologyStore:
 
     @staticmethod
     def _node_params(item: ObjectInstance) -> dict[str, Any]:
+        scalar_properties = {
+            str(key): value
+            for key, value in item.properties.items()
+            if value is not None and isinstance(value, (str, int, float, bool))
+        }
         return {
             "object_id": item.object_id,
             "object_type": item.object_type,
@@ -384,6 +543,7 @@ class Neo4jOntologyStore:
             "properties_json": json.dumps(item.properties, ensure_ascii=False, default=str),
             "metrics_json": json.dumps(item.metrics, ensure_ascii=False, default=str),
             "object_type_label": item.object_type,
+            **scalar_properties,
         }
 
     @staticmethod

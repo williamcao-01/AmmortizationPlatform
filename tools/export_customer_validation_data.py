@@ -128,11 +128,11 @@ def main() -> None:
                         "conclusion_cn": rule["conclusion_cn"],
                         "remaining_depreciable_amount": amount(inputs.get("剩余可折旧金额")),
                         "remaining_months": amount(inputs.get("剩余折旧月数")),
-                        "rule_opening_net_value": amount(inputs.get("期初净值")),
-                        "production_rate": amount(inputs.get("折耗率")),
+                        "rule_opening_net_value": amount(inputs.get("期初油气资产账面净额") or inputs.get("期初净值")),
+                        "production_rate": amount(inputs.get("当期折耗率") or inputs.get("折耗率")),
                         "workload_total_amortization": amount(inputs.get("当月总摊销额")),
-                        "workload_asset_opening_net": amount(inputs.get("资产期初净值")),
-                        "workload_pool_opening_net": amount(inputs.get("资产池期初净额")),
+                        "workload_asset_opening_net": amount(inputs.get("资产期初净额") or inputs.get("资产期初净值")),
+                        "workload_pool_opening_net": amount(inputs.get("计算采用资产池期初净额") or inputs.get("资产池期初净额")),
                         "source_event_id": line["source_event_id"] or "",
                     }
                 )

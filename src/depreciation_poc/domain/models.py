@@ -121,6 +121,8 @@ class FixedAsset:
     organization_id: str = ""
     snapshot_monthly_depreciation: Decimal = Decimal("0")
     snapshot_net_value: Decimal = Decimal("0")
+    cost_center_name: str = ""
+    profit_center_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -203,6 +205,7 @@ class MonthlyDriver:
     depletion_rate: Optional[Decimal] = None
     source_refs: tuple[str, ...] = ()
     assumption_note: str = ""
+    pool_opening_net_value: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)

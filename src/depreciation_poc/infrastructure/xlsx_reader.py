@@ -47,8 +47,16 @@ def read_sheet(path: str | Path, sheet_name: str) -> list[dict[str, str]]:
     if not raw_rows:
         return []
     headers = raw_rows[0]
+    header_names: dict[int, str] = {}
+    header_counts: dict[str, int] = {}
+    for index, raw_name in headers.items():
+        name = raw_name.strip()
+        if not name:
+            continue
+        header_counts[name] = header_counts.get(name, 0) + 1
+        header_names[index] = name if header_counts[name] == 1 else f"{name}__{header_counts[name]}"
     return [
-        {headers[index].strip(): value for index, value in row.items() if headers.get(index, "").strip()}
+        {header_names[index]: value for index, value in row.items() if index in header_names}
         for row in raw_rows[1:]
     ]
 
